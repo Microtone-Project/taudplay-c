@@ -8,10 +8,10 @@ import { resolve } from "node:path";
 
 const [root, file, rate, binaural, prefix] = process.argv.slice(2);
 const lib = (p) => import(pathToFileURL(resolve(root, p)).href);
-const { setSamplingRate } = await lib("src/engine/constants.js");
+const { setSamplingRate } = await lib("core/engine/constants.js");
 setSamplingRate(+rate);
 const { TaudRenderer } = await lib("src/taudplay/render.js");
-const { setRandomSource, makeSeededRandom } = await lib("src/engine/rng.js");
+const { setRandomSource, makeSeededRandom } = await lib("core/engine/rng.js");
 setRandomSource(makeSeededRandom(1));
 
 const hex = (x) => { const b = Buffer.alloc(8); b.writeDoubleLE(x); return b.readBigUInt64LE().toString(16).padStart(16, "0"); };

@@ -251,7 +251,7 @@ fuzzed songs.
 
 ## Relationship to the JS library
 
-This is a port of `src/engine`, `src/format`, `src/audio/offline-render.js`
+This is a port of `core/engine`, `core/format`, `core/audio/offline-render.js`
 and `src/taudplay/render.js` — the `TaudRenderer` half. The browser half
 (`TaudPlayer`, the AudioWorklet) has no C counterpart: its job, pulling blocks
 from an audio callback, is `taud_render`. Source files mirror the JS modules one

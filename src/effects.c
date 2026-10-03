@@ -258,10 +258,15 @@ void te_apply_effect_row(TaudEngine *e, TaudVoice *voice, int vi, int op, int ra
     case OP_S: apply_s_effect(e, voice, vi, rawArg); break;
     case OP_T: {
         int hi = (rawArg >> 8) & 0xff;
-        if (hi == 0xff) {
-            e->bpm = iclamp((rawArg & 0xff) + 0x118, 25, 535);
+        int lo = rawArg & 0xff;
+        if (hi >= 0xfc && lo != 0) {
+            /* T $FFxx..$FCxx (xx > 0): each prefix carries on where the one
+             * above stops — $FF 281..535, $FE 536..790, $FD 791..1045, $FC 1046.. */
+            e->bpm = iclamp(0x118 + (0xff - hi) * 0xff + lo, BPM_MIN, BPM_MAX);
+        } else if (hi == 0xfb && lo != 0) {
+            /* T $FBxx (xx > 0): RESERVED, ignored. */
         } else if (hi != 0) {
-            e->bpm = iclamp(hi + 0x19, 25, 535);
+            e->bpm = iclamp(hi + 0x19, BPM_MIN, BPM_MAX);
         } else {
             int low = rawArg & 0xff;
             switch (low & 0xf0) {

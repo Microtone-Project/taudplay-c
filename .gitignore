@@ -1,0 +1,11 @@
+CLAUDE.md
+*.a
+/build/
+*.o
+/taudplay
+/tests/compare
+/tests/jsmath_check
+/tests/out/
+/tests/robust
+/tests/scenario
+/tests/taudplay-final

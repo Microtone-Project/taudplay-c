@@ -203,6 +203,7 @@ TaudError te_parse_taud(const uint8_t *file, size_t len, TaudDoc *doc)
             tickPacked = en[8];
             s->tickRate = tickPacked & 0x7f;
             bpmStored |= (tickPacked & 0x80) << 1;
+            bpmStored |= (en[28] & 0x80) << 2;      /* song flags bit 7 = BPM bit 9 */
             s->bpm = bpmStored + 25;
             s->tuningBaseNote = (int)rd_u16(en + 9);
             s->tuningFreq = rd_f32(en + 11);
@@ -366,7 +367,7 @@ void te_load_into_engine(TaudEngine *e, const TaudDoc *doc, int songIndex)
         te_upload_cue(e, c, cueBytes, (size_t)chans * 2);
     }
 
-    e->bpm = iclamp(song->bpm, 25, 535);
+    e->bpm = iclamp(song->bpm, BPM_MIN, BPM_MAX);
     e->tickRate = (song->tickRate > 0 ? song->tickRate : 6) & 255;
     te_set_tuning(e, song->tuningBaseNote, song->tuningFreq);
     te_set_tracker_mixer_flags(e, song->globalFlags);

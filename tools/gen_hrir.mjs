@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 
 const root = resolve(process.argv[2] ?? "../microtone-taudplay");
-const m = await import(pathToFileURL(resolve(root, "src/engine/hrir-sadie.js")).href);
+const m = await import(pathToFileURL(resolve(root, "core/engine/hrir-sadie.js")).href);
 const f = m.decodeShHrir();
 const lines = [];
 lines.push("/* GENERATED FILE — do not edit. Rebuild with: node tools/gen_hrir.mjs <microtone-taudplay>");

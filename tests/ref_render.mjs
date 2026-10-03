@@ -10,7 +10,7 @@ import { resolve } from "node:path";
 const [root, file, song, seconds, out, mode] = process.argv.slice(2);
 const lib = (p) => import(pathToFileURL(resolve(root, p)).href);
 const { TaudRenderer } = await lib("src/taudplay/render.js");
-const { setRandomSource, makeSeededRandom } = await lib("src/engine/rng.js");
+const { setRandomSource, makeSeededRandom } = await lib("core/engine/rng.js");
 
 setRandomSource(makeSeededRandom(1));
 const r = new TaudRenderer(readFileSync(file), { songIndex: +song, binaural: mode === "binaural" });

@@ -13,7 +13,7 @@ import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 
 const [root, seedArg, out] = process.argv.slice(2);
-const { gzipSync } = await import(pathToFileURL(resolve(root, "vendor/fflate.esm.js")).href);
+const { gzipSync } = await import(pathToFileURL(resolve(root, "core/vendor/fflate.esm.js")).href);
 
 let seed = (+seedArg >>> 0) || 1;
 const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
@@ -230,7 +230,7 @@ const EFFECTS = [
     if (sub === 0xe) return 0xe000 | (ri(0, 2) << 8);
     return (sub << 12) | ri(0, 0xfff);
   }],
-  [0x1d, () => pick([ri(0x20, 0xff) << 8, 0xff00 | ri(0, 255), ri(0, 0x1f)])],
+  [0x1d, () => pick([ri(0x20, 0xff) << 8, 0xff00 | ri(0, 255), ri(0, 0x1f), (ri(0xfb, 0xfe) << 8) | ri(0, 255)])],
   [0x1e, () => ri(0, 0xffff)], [0x1f, () => ri(0, 255) << 8],
   [0x20, () => ri(0, 255) << 8], [0x21, () => ri(0, 0xffff)], [0x22, () => ri(0, 0xffff)],
   [0x23, () => chance(0.5) ? 0xf000 | ri(0, 0xfff) : ri(0, 0xfff)],
@@ -304,7 +304,7 @@ for (let s = 0; s < nSongs; s++) {
     for (let ch = 0; ch < 16; ch++) if ((w0 >> ch) & 1) words[ch] |= 0x8000;
     for (let ch = 0; ch < chans; ch++) w16(cues, c * stride + ch * 2, words[ch]);
   }
-  songs.push({ pats, cues, nPats, nCues, bpm: ri(80, 200), tick: ri(3, 8),
+  songs.push({ pats, cues, nPats, nCues, bpm: chance(0.25) ? ri(537, 1048) : ri(80, 200), tick: ri(3, 8),
     flags: pick([0, 0, 1, 2, 4, 8, 12, 16, 20]), gv: ri(64, 255), mv: ri(64, 255),
     tuneNote: pick([0, 0xa000, 0x5000]), tuneFreq: pick([0, 8363, 261.6255653005986, 440]) });
 }
@@ -344,7 +344,7 @@ songs.forEach((s, i) => {
   w32(table, e + 18, pc.length);
   w32(table, e + 22, cc.length);
   w16(table, e + 26, s.nCues);
-  table[e + 28] = surround;
+  table[e + 28] = surround | ((bpmStored >> 9) & 1) << 7;
   songBlobs.push(pc, cc);
   off += pc.length + cc.length;
 });

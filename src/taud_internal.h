@@ -34,6 +34,10 @@
 #define TUNING_REF_C4_HZ LINEAR_FREQ_C4_HZ
 #define TUNING_DEFAULT_BASE_NOTE 0xa000
 #define TUNING_DEFAULT_FREQ_HZ 8363.0
+/* The tempo register: ten bits biased by -25 (song table byte 7, byte 8 bit 7,
+ * byte 28 bit 7), so 25..1048 BPM. Every path that sets the tempo clamps to it. */
+#define BPM_MIN 25
+#define BPM_MAX (25 + 0x3ff)
 #define RAMP_OUT_SEC 0.008
 #define FAST_FADE_SEC 0.3
 #define VOL_RAMP_SEC 0.002
