@@ -154,7 +154,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
             instGv = inst->instGlobalVolume / 255.0;
             swingScale = 1.0 + voice->randomVolBias / 255.0;
             voice->envVolMix += voice->envVolStep;
-            effEnvVol = voice->volEnvOn ? voice->envVolMix : 1.0;
+            effEnvVol = voice->hasVolEnv && voice->volEnvOn ? voice->envVolMix : 1.0;
             te_advance_volume_ramp(e, voice, e->volDiv);
             te_advance_pitch_ramp(e, voice, spt);
             faderGain = (255 - voice->fader) / 255.0;
@@ -216,7 +216,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
             instGv = inst->instGlobalVolume / 255.0;
             swingScale = 1.0 + bg->randomVolBias / 255.0;
             bg->envVolMix += bg->envVolStep;
-            effEnvVol = bg->volEnvOn ? bg->envVolMix : 1.0;
+            effEnvVol = bg->hasVolEnv && bg->volEnvOn ? bg->envVolMix : 1.0;
             te_advance_volume_ramp(e, bg, e->volDiv);
             te_advance_pitch_ramp(e, bg, spt);
             faderGain = (255 - bgFader) / 255.0;

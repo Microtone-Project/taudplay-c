@@ -288,7 +288,7 @@ bool te_is_sounding_child(const TaudEngine *e, const TaudVoice *bg, int vi)
 
 static double display_weight(const TaudVoice *v)
 {
-    double env = v->volEnvOn ? v->envVolMix : 1.0;
+    double env = v->hasVolEnv && v->volEnvOn ? v->envVolMix : 1.0;
     return env * v->fadeoutVolume * v->currentMixVolume * v->layerMixGain * ((255 - v->fader) / 255.0);
 }
 

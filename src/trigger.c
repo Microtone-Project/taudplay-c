@@ -27,6 +27,9 @@ static void resolve_active_envelopes(TaudVoice *v, const TaudInst *inst, const T
         v->activeVolEnvLoop = inst->volEnvLoop;
         v->activeVolEnvSustain = inst->volEnvSustainWord;
     }
+    /* The volume envelope answers to its P bit like every other envelope (spec
+     * §7.2): a record that says "absent" plays at unity whatever its nodes hold. */
+    v->hasVolEnv = te_env_present(v->activeVolEnvLoop);
     if (patch != NULL && patch->hasPanEnv) {
         v->activePanEnv = patch->panEnv;
         v->activePanEnvLoop = patch->panEnvLoop;
@@ -621,6 +624,7 @@ static TaudVoice *ghost_voice(TaudEngine *e, const TaudVoice *src, int channel)
     v->envPanIndex = src->envPanIndex;
     v->envPanTimeSec = src->envPanTimeSec;
     v->envPan = src->envPan;
+    v->hasVolEnv = src->hasVolEnv;
     v->hasPanEnv = src->hasPanEnv;
     v->hasPitchEnv = src->hasPitchEnv;
     v->envPitchIndex = src->envPitchIndex;

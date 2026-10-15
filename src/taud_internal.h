@@ -422,6 +422,7 @@ struct TaudVoice {
     bool keyOff;
     int envIndex;
     double envTimeSec, envVolume, envVolMix, envVolStep;
+    bool hasVolEnv;             /* the ACTIVE volume envelope's P bit */
     int envPanIndex;
     double envPanTimeSec, envPan;
     bool hasPanEnv;
