@@ -3,12 +3,12 @@
 #include <string.h>
 #include "../src/taud_internal.h"
 
-static const char *NAMES[] = { "sin", "cos", "tan", "exp", "log10", "log2", "acos", "asin", "atan2", "pow" };
+static const char *NAMES[] = { "sin", "cos", "tan", "exp", "log10", "log2", "acos", "asin", "atan2", "log", "pow" };
 int main(int argc, char **argv)
 {
     FILE *f = fopen(argc > 1 ? argv[1] : "tests/out/jsmath.bin", "rb");
     double r[4];
-    long total[10] = {0}, bad[10] = {0};
+    long total[11] = {0}, bad[11] = {0};
     int i, fail = 0;
     if (f == NULL) return 2;
     while (fread(r, 8, 4, f) == 4) {
@@ -24,6 +24,7 @@ int main(int argc, char **argv)
         case 6: v = js_acos(r[1]); break;
         case 7: v = js_asin(r[1]); break;
         case 8: v = js_atan2(r[1], r[2]); break;
+        case 9: v = js_log(r[1]); break;
         default: v = js_pow(r[1], r[2]); break;  /* whichever the engine uses */
         }
         total[id]++;
@@ -32,7 +33,7 @@ int main(int argc, char **argv)
             bad[id]++;
         }
     }
-    for (i = 0; i < 10; i++) {
+    for (i = 0; i < 11; i++) {
         printf("%-6s %9ld args, %ld mismatches\n", NAMES[i], total[i], bad[i]);
         if (bad[i]) fail = 1;
     }

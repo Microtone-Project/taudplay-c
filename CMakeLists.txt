@@ -23,9 +23,9 @@ if(MATH_LIB)
   target_link_libraries(taudplay PUBLIC ${MATH_LIB})
 endif()
 
-option(TAUDPLAY_FDLIBM_POW "Use the bundled fdlibm pow instead of the platform's" OFF)
-if(TAUDPLAY_FDLIBM_POW)
-  target_compile_definitions(taudplay PRIVATE TAUD_FDLIBM_POW)
+option(TAUDPLAY_LIBM_POW "Use the platform's pow instead of the bundled V8 one (not bit-exact)" OFF)
+if(TAUDPLAY_LIBM_POW)
+  target_compile_definitions(taudplay PRIVATE TAUD_LIBM_POW)
 endif()
 
 add_executable(taudplay-cli tools/taudplay.c)

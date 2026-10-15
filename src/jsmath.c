@@ -367,6 +367,8 @@ static double ieee_log(double x)
     return dk * ln2_hi - ((s * (f - R) - dk * ln2_lo) - f);
 }
 
+double js_log(double x) { return ieee_log(x); }
+
 double js_log10(double x)
 {
     static const double ivln10 = 4.34294481903251816668e-01,
@@ -778,7 +780,9 @@ double js_fdlibm_pow(double x, double y)
     w = v - (z - u);
     t = z * z;
     t1 = z - t * (P1 + t * (P2 + t * (P3 + t * (P4 + t * P5))));
-    r = (z * t1) / (t1 - 2.0) - (w + z * w);
+    /* V8's grouping, not fdlibm's (z*t1)/(t1-2) - (w+z*w): base/ieee754.cc
+     * divides by the whole bracket, and Math.pow is what it computes. */
+    r = (z * t1) / ((t1 - 2.0) - (w + z * w));
     z = 1.0 - (r - z);
     j = hi_word(z);
     j += (int32_t)((uint32_t)n << 20);

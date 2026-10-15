@@ -14,6 +14,7 @@ const gens = [
   ["acos", () => [u(-1, 1)], (a) => Math.acos(a)],
   ["asin", () => [u(-1, 1)], (a) => Math.asin(a)],
   ["atan2", () => [u(-10, 10), rnd() < 0.1 ? u(-1e-3, 1e-3) : u(-10, 10)], (a, b) => Math.atan2(a, b)],
+  ["log", () => [rnd() < 0.5 ? u(0, 4) : Math.exp(u(-700, 700))], (a) => Math.log(a)],
   ["pow", () => {
     const r = rnd();
     if (r < 0.3) return [2, Math.round(u(-90000, 90000)) / 4096];
