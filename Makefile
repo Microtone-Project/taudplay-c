@@ -13,7 +13,7 @@ CFLAGS  += -std=c99 -Wall -Wextra -ffp-contract=off -Iinclude
 LDLIBS  += -lm
 
 SRCS = src/jsmath.c src/tables.c src/inst.c src/samplemod.c src/sampler.c src/envelope.c \
-       src/filter.c src/fm.c src/spatial.c src/binaural.c src/hrir_sadie.c \
+       src/filter.c src/fm.c src/opl.c src/formant.c src/spatial.c src/binaural.c src/hrir_sadie.c \
        src/mastering.c src/trigger.c src/effects.c src/row.c src/tick.c \
        src/mixer.c src/engine.c src/parse.c src/zstd.c src/inflate.c \
        src/resample.c src/player.c
@@ -46,6 +46,10 @@ check: all tests/compare tests/scenario tests/jsmath_check
 	JS=$(JS) sh tests/scenario.sh $(JS)/test/corpus/WHEN.taud 48000 0
 	JS=$(JS) sh tests/scenario.sh $(JS)/test/corpus/slumberjack.taud 44100 1
 	JS=$(JS) sh tests/fuzz.sh 1 12 8
+	FUZZ_INSTS=formant node tests/gen_fuzz.mjs $(JS) 3 tests/out/formant.taud
+	JS=$(JS) sh tests/scenario.sh tests/out/formant.taud 44100 0
+	FUZZ_INSTS=opl node tests/gen_fuzz.mjs $(JS) 6 tests/out/opl.taud
+	JS=$(JS) sh tests/scenario.sh tests/out/opl.taud 22050 1
 
 clean:
 	rm -f $(OBJS) libtaudplay.a taudplay tests/compare tests/scenario tests/robust tests/jsmath_check

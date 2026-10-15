@@ -60,7 +60,7 @@ void te_advance_envelope(TaudEngine *e, TaudVoice *v, double tickSec)
     int w[2], pStart, pEnd;
     bool pWrapping;
 
-    if (v->volEnvOn) {
+    if (v->hasVolEnv && v->volEnvOn) {
         int wStart, wEnd;
         bool wrapping;
         resolve_env_wrap(v->activeVolEnvLoop, v->activeVolEnvSustain, v->keyOff, w);

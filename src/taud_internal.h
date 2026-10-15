@@ -140,23 +140,25 @@ static inline double dmin(double a, double b) { return a < b ? a : b; }
 static inline double dmax(double a, double b) { return a > b ? a : b; }
 
 /* JavaScript's transcendental functions (jsmath.c): fdlibm, exactly as V8
- * computes them, whatever the platform's libm. `pow` is the one V8 does not
- * take from fdlibm — it agrees bit-for-bit with glibc's and musl's, so the
- * platform pow is used unless TAUD_FDLIBM_POW asks for the portable one. */
+ * computes them, whatever the platform's libm — `pow` included: V8's is its
+ * own fdlibm port (base/ieee754.cc, with one grouping of its own), not the C
+ * library's. TAUD_LIBM_POW swaps in the platform pow (closer to correctly
+ * rounded, no longer bit-exact against the JS). */
 double js_sin(double x);
 double js_cos(double x);
 double js_tan(double x);
 double js_exp(double x);
 double js_log10(double x);
 double js_log2(double x);
+double js_log(double x);
 double js_acos(double x);
 double js_asin(double x);
 double js_atan2(double y, double x);
 double js_fdlibm_pow(double x, double y);
-#ifdef TAUD_FDLIBM_POW
-#define js_pow js_fdlibm_pow
-#else
+#ifdef TAUD_LIBM_POW
 #define js_pow pow
+#else
+#define js_pow js_fdlibm_pow
 #endif
 
 /** Math.fround. */
@@ -225,6 +227,127 @@ typedef struct {
     uint16_t program[128];
 } TaudMeta;
 
+/* ── OPL instruments, Metainstrument type 8 (opl.js) ───────────────────── */
+
+#define META_TYPE_OPL 8
+#define OPL_BLOCK_START 197
+#define OPL_BLOCK_LEN 54
+#define OPL_C4_RATE 8363
+
+typedef struct {
+    int am, vib, eg, ksr, mult, ksl, tl, ar, dr, sl, rr, ws;
+} TaudOplOperator;
+
+/* A decoded type-8 patch (OplPatch). */
+typedef struct {
+    int gen;
+    int kind;
+    bool deepTremolo, deepVibrato, nts, lowFnum;
+    int feedback, cntA, cntB, partnerMult, partnerDetune;
+    TaudOplOperator ops[4];
+    int outputs;
+} TaudOplPatch;
+
+/* One sounding OPL channel (OplState), hung off a voice. */
+typedef struct {
+    const TaudOplPatch *patch;
+    int gen;
+    double rate;
+    uint32_t phase[4];
+    int32_t inc[4], env[4];
+    uint8_t state[4];
+    int32_t out[4], prev[4], kslAtt[4], ksrOffset[4];
+    uint32_t hhPhase, tcPhase;
+    int32_t hhInc, tcInc;
+    uint32_t noise;
+    bool keyed;
+    bool kValid;                /* false = the JS NaN: not yet on the chip clock */
+    int64_t k;
+    double cur, last;
+    double vol;
+    int volAtt;
+} TaudOplState;
+
+/* ── formant instruments, Metainstrument type 1 (formant.js) ───────────── */
+
+#define META_TYPE_FORMANT 1
+#define FORMANT_BLOCK_START 197
+#define FORMANT_BLOCK_LEN 54
+#define FORMANT_SLOTS 3
+#define FORMANT_TRACK_MAX 24    /* doubles: 12 (time, value) points; the longest track has 11 */
+#define NORM_HARMONICS 64
+
+typedef struct {
+    int cons;
+    uint32_t ptr;
+    int len, offset, rate, tilt, gain;
+} TaudFormantSlot;
+
+/* The decoded tract block (FormantPatch). */
+typedef struct {
+    uint32_t srcPtr;
+    int front, open, round, track, refNote, glide, timing;
+    int semivowel;
+    bool rhotic;
+    uint32_t rangeLo, rangeHi;
+    TaudFormantSlot slots[FORMANT_SLOTS];
+} TaudFormantPatch;
+
+typedef struct {
+    int n;                      /* doubles used (2 per point) */
+    double p[FORMANT_TRACK_MAX];
+} TaudFormantTrack;
+
+struct TaudConsonant;
+
+/* One consonant as it sounds (FormantSegment). `next` is an index into the
+ * onset array, -1 for the vowel. */
+typedef struct {
+    const struct TaudConsonant *row;
+    TaudFormantSlot slot;
+    double end;
+    TaudFormantTrack w, av, ah, af, nz;
+    int next;
+} TaudFormantSegment;
+
+typedef struct {
+    const TaudFormantPatch *patch;
+    int phase;
+    int onsetCount;
+    TaudFormantSegment onset[2];
+    int seg;
+    bool hasCoda;
+    TaudFormantSegment coda;
+    double t;
+    bool codaVeto, fresh;
+    int upd, ctl, normCount;
+    bool ownVowel;
+    int sv;                     /* SEMIVOWELS index, 0 = none */
+    TaudFormantTrack svW, svAv;
+    double svT, svEnd;
+    double VG[5], VGB[5];
+    bool rejoin;
+    double vFront, vOpen, vRound, gFront, gOpen, gRound, tFront, tOpen, tRound;
+    double glideLeft;
+    double av, avStep, ah, ahStep, af, afStep;
+    double nv, nvStep, nvGoal;
+    double nb, sg, sm;
+    bool sgDue;
+    double hw[NORM_HARMONICS + 1];
+    int hwK;
+    double casc[21], bank[15], bankGain[6];
+    double cy[14], by[10];
+    bool nOn;
+    int64_t nBase;
+    int nSpan;
+    double nPos, nStep;
+    int nTilt;
+    double nTiltC, nGain, nZ;
+    bool nGen;
+    uint32_t nSeed;
+    double V[5], VB[5], F[5], B[5];
+} TaudFormantState;
+
 /* Sample-modification masks are sized per loop/sample and never exceed a
  * 16-bit length, so one lazily allocated 8 KiB buffer per mask serves. */
 #define MOD_MASK_CAP 8192
@@ -254,6 +377,8 @@ typedef struct TaudInst {
     int patchCount;
 
     TaudMeta *meta;             /* NULL unless a metainstrument */
+    TaudOplPatch *opl;          /* NULL unless a type-8 OPL instrument */
+    TaudFormantPatch *formant;  /* NULL unless a type-1 formant instrument */
 
     /* Invert loop (S $F0xx). invertMaskLen 0 = no mask. */
     uint8_t *invertMask;
@@ -294,8 +419,19 @@ static inline int inst_sample_detune_signed(const TaudInst *i)
     int v = i->sampleDetune & 0xffff;
     return v >= 0x8000 ? v - 0x10000 : v;
 }
-static inline int inst_dup_check_type(const TaudInst *i) { return i->dupCheckFlag & 0x03; }
-static inline int inst_dup_check_action(const TaudInst *i) { return (i->dupCheckFlag >> 2) & 0x03; }
+/* Byte 195's two nibbles, `0b AATT aatt` (packDupCheck). */
+static inline int inst_dup_check_type(const TaudInst *i)
+{
+    return (i->dupCheckFlag & 0x03) | ((i->dupCheckFlag >> 2) & 0x0c);
+}
+static inline int inst_dup_check_action(const TaudInst *i)
+{
+    return ((i->dupCheckFlag >> 2) & 0x03) | ((i->dupCheckFlag >> 4) & 0x0c);
+}
+/* Duplicate Check Type 4 (item 216): every note arriving on the lane. */
+#define DCT_LANE 4
+static inline bool inst_is_opl(const TaudInst *i) { return i->opl != NULL; }
+static inline bool inst_is_formant(const TaudInst *i) { return i->formant != NULL; }
 static inline bool inst_filter_sf_mode(const TaudInst *i) { return ((i->fadeoutHigh >> 4) & 1) != 0; }
 static inline int inst_default_azimuth(const TaudInst *i)
 {
@@ -401,6 +537,14 @@ struct TaudVoice {
     bool fmOperator;
     TaudVoice *fmParent;
 
+    /* OPL channel (item 209): NULL or &oplStore, kept across notes. */
+    TaudOplState *opl;
+    TaudOplState oplStore;
+    bool oplCarry;
+    /* Formant tract (item 212): NULL or &formantStore. */
+    TaudFormantState *formant;
+    TaudFormantState formantStore;
+
     int noteVolume, channelVolume, rowVolume;
     int channelPan, rowPan;
     bool channelVolumeSet, channelPanSet;
@@ -422,6 +566,7 @@ struct TaudVoice {
     bool keyOff;
     int envIndex;
     double envTimeSec, envVolume, envVolMix, envVolStep;
+    bool hasVolEnv;             /* the ACTIVE volume envelope's P bit */
     int envPanIndex;
     double envPanTimeSec, envPan;
     bool hasPanEnv;
@@ -634,6 +779,32 @@ void te_master_chain_process(TaudMasterChain *c, float *left, float *right, int 
 
 /* ── the engine (engine.js + state.js Playhead/TrackerState) ───────────── */
 
+/* formant.js's module-level tables, computed once per engine. The bank grid
+ * is built at the engine rate: formant.js builds it when the module loads,
+ * from the rate set by then (setSamplingRate before the import, as the
+ * reference harness does). */
+#define ISO226_N 29
+#define BANK_GRID_MAX 64
+#define SOURCE_DFT_MAX 4096
+typedef struct {
+    double logCard[4][4][2];
+    double elwLogF[ISO226_N], elwDb[ISO226_N];
+    int bankN;
+    double bankW[BANK_GRID_MAX], bankC1[BANK_GRID_MAX], bankS1[BANK_GRID_MAX];
+    double bankC2[BANK_GRID_MAX], bankS2[BANK_GRID_MAX];
+    double bankRef;
+    double dft[SOURCE_DFT_MAX];     /* scratch */
+    /* sourceHarmonics' memo: the same bytes measure the same. */
+    int memoCount;
+    struct {
+        int64_t p, N;
+        double m, P;
+        uint32_t h;
+        int K;
+        double w[NORM_HARMONICS + 1];
+    } memo[32];
+} TaudFormantTables;
+
 typedef struct TaudVoiceChunk {
     struct TaudVoiceChunk *next;
     int count;
@@ -673,6 +844,7 @@ typedef struct TaudEngine {
     int cuePos, rowIndex, tickInRow;
     double samplesIntoTick;
     bool firstRow;
+    int64_t oplFrame;           /* the OPL chip clock: frames mixed since reset */
     TaudVoice voices[MAX_VOICES];
     int toneMode, interpolationMode;
     bool ledFilterOn;
@@ -718,6 +890,7 @@ typedef struct TaudEngine {
 
     /* Tables. */
     double sincTable[SINC_TABLE_SIZE];
+    TaudFormantTables formantTables;
 
     bool oom;                   /* an allocation failed on the render path */
 } TaudEngine;
@@ -746,6 +919,7 @@ void te_set_surround_model(TaudEngine *e, int model);
 void te_set_monitor_mode(TaudEngine *e, int mode);
 void te_set_mastering(TaudEngine *e, const TaudMastering *params);
 void te_set_cue_position(TaudEngine *e, int pos);
+void te_reset_play_state(TaudEngine *e);
 void te_set_tracker_row(TaudEngine *e, int row);
 void te_play(TaudEngine *e);
 void te_stop(TaudEngine *e);
@@ -903,6 +1077,29 @@ void te_fm_seed_gains(TaudFmRig *rig, const TaudMeta *meta);
 double te_render_fm_voice(TaudEngine *e, TaudVoice *v, int interpMode, double spt);
 void te_drop_fm_operators(TaudEngine *e, int vi);
 
+/* opl.c */
+void te_decode_opl_patch(const uint8_t *bytes, TaudOplPatch *into);
+void te_opl_state_init(TaudOplState *st);
+void te_opl_key_on(TaudOplState *st, const TaudOplPatch *patch, bool carry);
+void te_opl_key_off(TaudOplState *st);
+void te_opl_reattack(TaudOplState *st);
+double te_render_opl_voice(TaudEngine *e, TaudVoice *v, int64_t frame);
+
+/* formant.c */
+#define PHASE_ONSET 0
+#define PHASE_VOWEL 1
+#define PHASE_CODA 2
+#define PHASE_DONE 3
+void te_formant_tables_init(TaudFormantTables *t, int rate);
+void te_decode_formant_block(const uint8_t *raw, TaudFormantPatch *patch);
+void te_formant_state_init(TaudFormantState *st);
+void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch);
+void te_formant_restart(TaudEngine *e, TaudFormantState *st);
+void te_formant_relatch(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch);
+void te_formant_start_at_vowel(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch);
+void te_formant_set_vowel(TaudFormantState *st, int f, int g, int r);
+double te_render_formant_voice(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode);
+
 /* spatial.c */
 double te_wrap_azimuth(double a);
 double te_fold_azimuth_to_pan(double az);
@@ -945,7 +1142,7 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *v, int vi, int noteVal, i
 void te_trigger_note(TaudEngine *e, TaudVoice *v, int noteVal, int instId, int volOverride);
 int te_narrow_vol_axis(const TaudEngine *e, int v);
 void te_apply_duplicate_check(TaudEngine *e, int channel, int instId, int note);
-void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *v, int channel);
+void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *v, int channel, int incomingInst);
 void te_apply_past_note_action(TaudEngine *e, int channel, int action);
 void te_apply_vol_column(TaudEngine *e, TaudVoice *v, int value, int sel);
 void te_apply_pan_column(TaudEngine *e, TaudVoice *v, int value, int sel);
@@ -958,6 +1155,7 @@ int te_apply_retrig_vol_mod(int vol, int x, int step, int max);
 /* row.c */
 void te_apply_tracker_row(TaudEngine *e);
 void te_advance_row(TaudEngine *e);
+void te_advance_row_position(TaudEngine *e);
 void te_reconstruct_ditto_state(TaudEngine *e, int startRow);
 
 /* tick.c */

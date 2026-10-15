@@ -1,8 +1,9 @@
 // Generates a deterministic, randomised .taud that exercises as much of the
 // engine as it can reach: every effect column command, both cell formats,
 // 32 and 64 lanes, surround models, envelopes of every kind, IT and SF2
-// filters, NNA / duplicate checks, Ixmp patches (stereo included), layered
-// and FM metainstruments, sample modifications, interrupts and mastering.
+// filters, NNA / duplicate checks (the lane check included), Ixmp patches
+// (stereo included), layered and FM metainstruments, OPL and formant
+// instruments, sample modifications, interrupts and mastering.
 //
 //   node tests/gen_fuzz.mjs <microtone-taudplay> SEED OUT.taud
 //
@@ -109,11 +110,98 @@ for (let idx = 1; idx <= 24; idx++) {
   b[186] = ri(0, 255);
   b[187] = chance(0.4) ? ri(0, 255) : 0;
   b[188] = chance(0.3) ? ri(0, 255) : 0;
-  b[195] = chance(0.3) ? ri(0, 15) : 0;
+  b[195] = chance(0.3) ? ri(0, 255) : 0;
   b[196] = chance(0.5) ? ri(1, 255) : 0;
   b[251] = chance(0.3) ? ri(0, 255) : 0;
   b[252] = ri(0, 255); b[253] = ri(0, 255); b[254] = ri(0, 255);
   sampleInsts.push(idx);
+}
+
+// The ordinary fields of a typed record (OPL type 8, formant type 1): bytes
+// 4…196 and 251…255, the second pitch/filter slot left to the type's block.
+function typedFields(b, s) {
+  w16(b, 4, s ? s.len : ri(0, 0xffff));
+  w16(b, 6, chance(0.3) ? 0 : pick([8363, 16726, 22050, ri(2000, 40000)]));
+  w16(b, 8, 0);
+  const len = s ? s.len : 64;
+  const ls = ri(0, len - 2), le = ri(ls + 1, len);
+  w16(b, 10, ls); w16(b, 12, le);
+  b[14] = ri(0, 3) | (chance(0.2) ? 4 : 0);
+  if (chance(0.5)) { const n = randEnv(b, 21, 63); const [l, su] = randLoopWords(n, { carry: chance(0.2) }); w16(b, 15, l); w16(b, 189, su); }
+  else { for (let k = 0; k < 25; k++) b[21 + 2 * k] = chance(0.5) ? 0x3f : ri(0, 63); w16(b, 15, 0); }
+  if (chance(0.3)) { const n = randEnv(b, 71, 255); const [l, su] = randLoopWords(n); w16(b, 17, l); w16(b, 191, su); }
+  if (chance(0.3)) { const n = randEnv(b, 121, 255); const [l, su] = randLoopWords(n, { bit7: chance(0.5) }); w16(b, 19, l); w16(b, 193, su); }
+  b[171] = ri(128, 255);
+  b[172] = ri(0, 255);
+  b[173] = ri(0, 3) | (chance(0.3) ? 0x10 : 0);
+  b[174] = chance(0.3) ? ri(0, 40) : 0;
+  b[175] = chance(0.3) ? ri(0, 255) : 0;
+  b[177] = ri(0, 255);
+  w16(b, 178, 0x5000);
+  b[182] = chance(0.4) ? ri(0, 255) : 0xff;
+  b[183] = ri(0, 255);
+  w16(b, 184, chance(0.3) ? ri(0, 0xffff) : 0);
+  b[186] = pick([0, 1, 1, 2, 3]) | (chance(0.2) ? 0x20 : 0) | (ri(0, 7) << 2);
+  b[187] = chance(0.3) ? ri(0, 255) : 0;
+  b[188] = chance(0.3) ? ri(0, 255) : 0;
+  b[195] = chance(0.5) ? ri(0, 255) : pick([0x04, 0x14, 0x24, 0x10, 0x02, 0x06]);
+  b[196] = chance(0.5) ? ri(1, 255) : 0;
+  b[251] = chance(0.3) ? ri(0, 255) : 0;
+}
+
+// OPL instruments (type 8): every kind, random registers.
+const oplInsts = [];
+for (let idx = 50; idx < 56; idx++) {
+  const b = rec(idx);
+  b.fill(0);
+  b.set([0x80, 0x00, 0xff, 0xff], 0);
+  typedFields(b, null);
+  const blk = b.subarray(197, 251);
+  blk[0] = (idx === 50 ? 0 : idx === 51 ? 1 : ri(0, 6)) | (ri(0, 15) << 3);
+  blk[1] = ri(0, 15); blk[2] = ri(0, 1); blk[3] = ri(0, 15);
+  w16(blk, 4, ri(-3000, 3000) & 0xffff);
+  for (let k = 0; k < 4; k++) {
+    const o = 6 + k * 5;
+    blk[o] = ri(0, 255); blk[o + 1] = chance(0.5) ? ri(0, 63) : ri(0, 255);
+    blk[o + 2] = (ri(1, 15) << 4) | ri(0, 15); blk[o + 3] = ri(0, 255); blk[o + 4] = ri(0, 7);
+  }
+  oplInsts.push(idx);
+}
+
+// Formant instruments (type 1): a source, a vowel, consonant slots, a glide.
+const CONS_IDS = [0, 0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 13, 14, 15, 16, 32, 34, 37, 40, 41, 44, 45, 48, 49, 50, 51,
+  52, 54, 55, 56, 58, 60, 62, 64, 66, 67, 68, 69, 70, 72, 74, 80, 81, 83, 85, 86, 88, 90, 96, 98, 100, 104, 105, 200];
+const formantInsts = [];
+for (let idx = 60; idx < 65; idx++) {
+  const b = rec(idx);
+  b.fill(0);
+  b.set([0x10, 0x00, 0xff, 0xff], 0);
+  const s = samples[pick([0, 1, 2, 5, ri(0, samples.length - 1)])];
+  typedFields(b, s);
+  const blk = b.subarray(197, 251);
+  blk[0] = s.ptr & 0xff; blk[1] = (s.ptr >>> 8) & 0xff; blk[2] = (s.ptr >>> 16) & 0xff;
+  blk[3] = ri(0, 255); blk[4] = ri(0, 255); blk[5] = ri(0, 255);
+  blk[6] = pick([0, 64, ri(0, 255)]);
+  w16(blk, 7, pick([0x4000, 0x5000, ri(0x3000, 0x7000)]));
+  blk[9] = pick([0, 20, ri(0, 255)]);
+  blk[10] = pick([128, ri(64, 192), ri(0, 255)]);
+  const lo = pick([s.ptr, 16]);
+  w16(blk, 11, lo & 0xffff); blk[13] = lo >>> 16;
+  w16(blk, 14, (lo + 4096) & 0xffff); blk[16] = (lo + 4096) >>> 16;
+  for (let k = 0; k < 3; k++) {
+    const o = 17 + k * 12;
+    const ns = samples[ri(0, samples.length - 1)];
+    blk[o] = pick(CONS_IDS);
+    if (chance(0.6)) {
+      blk[o + 1] = ns.ptr & 0xff; blk[o + 2] = (ns.ptr >>> 8) & 0xff; blk[o + 3] = ns.ptr >>> 16;
+      w16(blk, o + 4, ns.len); w16(blk, o + 6, chance(0.5) ? 0 : ri(0, ns.len));
+      w16(blk, o + 8, chance(0.1) ? 0 : ri(2000, 48000));
+    }
+    blk[o + 10] = chance(0.5) ? 0 : ri(0, 255);
+    blk[o + 11] = chance(0.5) ? 0 : ri(0, 255);
+  }
+  blk[53] = (chance(0.5) ? ri(0, 7) : 0) | (chance(0.3) ? 0x80 : 0);
+  formantInsts.push(idx);
 }
 
 // Layered metainstruments (type 0) and FM racks (type 4).
@@ -143,7 +231,7 @@ for (let idx = 30; idx < 34; idx++) {
   const layers = [];
   for (let k = 0; k < nL; k++) {
     const ps = chance(0.7) ? 0 : ri(0, 0x8000);
-    layers.push({ inst: pick(sampleInsts), mix: ri(100, 200), detune: ri(-2000, 2000),
+    layers.push({ inst: chance(0.8) ? pick(sampleInsts) : pick([...oplInsts, ...formantInsts]), mix: ri(100, 200), detune: ri(-2000, 2000),
       ps, pe: chance(0.7) ? 0xffff : ri(ps, 0xffff), vs: 0, ve: chance(0.8) ? 63 : ri(0, 63),
       fixed: chance(0.2) });
   }
@@ -155,7 +243,7 @@ for (let idx = 40; idx < 43; idx++) {
   const nOps = ri(2, 4);
   const ops = [];
   for (let k = 0; k < nOps; k++) {
-    ops.push({ inst: pick(sampleInsts.slice(0, 6)), mix: ri(120, 200), detune: ri(-300, 3000),
+    ops.push({ inst: chance(0.9) ? pick(sampleInsts.slice(0, 6)) : pick([...oplInsts, ...formantInsts]), mix: ri(120, 200), detune: ri(-300, 3000),
       ps: 0, pe: 0xffff, vs: 0, ve: 63, fixed: false });
   }
   const progs = [
@@ -187,7 +275,7 @@ function patchRecord(p) {
   return bytes;
 }
 const ixmp = [];
-for (const idx of sampleInsts.slice(0, 10)) {
+for (const idx of [...sampleInsts.slice(0, 10), oplInsts[0], formantInsts[0]]) {
   if (!chance(0.6)) continue;
   const n = ri(1, 3);
   const bytes = [];
@@ -224,7 +312,7 @@ const EFFECTS = [
   [0x18, () => ri(0, 0x2000)], [0x19, () => ri(0, 255) << 8],
   [0x1a, () => ri(0, 255) << 8], [0x1b, () => ri(0, 0xffff)],
   [0x1c, () => {
-    const sub = pick([0, 1, 2, 3, 4, 5, 6, 7, 7, 8, 0xb, 0xc, 0xd, 0xe, 0xf]);
+    const sub = pick([0, 1, 2, 3, 4, 5, 6, 7, 7, 8, 0xa, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf]);
     if (sub === 0xd) return 0xd000 | (ri(0, 5) << 8) | (ri(0, 4) << 4) | ri(0, 4);
     if (sub === 0xb) return 0xb000 | (ri(0, 2) << 8);
     if (sub === 0xe) return 0xe000 | (ri(0, 2) << 8);
@@ -247,7 +335,20 @@ function randNote() {
   if (r < 0.10) return ri(0x10, 0x1f);
   return ri(0x3000, 0x7000);
 }
-const instChoices = [...sampleInsts, 30, 31, 32, 33, 40, 41, 42];
+// FUZZ_WILD=1 overwrites every OPL and formant block with random bytes (for
+// the sanitizer build: pointers, lengths and rates anywhere at all).
+if (process.env.FUZZ_WILD) {
+  for (const idx of [...oplInsts, ...formantInsts]) {
+    const blk = rec(idx).subarray(197, 251);
+    for (let k = 0; k < blk.length; k++) blk[k] = ri(0, 255);
+    if (formantInsts.includes(idx)) for (let k = 4; k < 15; k++) rec(idx)[k] = ri(0, 255);
+  }
+}
+
+// FUZZ_INSTS=opl|formant narrows the patterns to one kind, to isolate a failure.
+const instChoices = process.env.FUZZ_INSTS === "opl" ? oplInsts
+  : process.env.FUZZ_INSTS === "formant" ? formantInsts
+  : [...sampleInsts, 30, 31, 32, 33, 40, 41, 42, ...oplInsts, ...oplInsts, ...formantInsts, ...formantInsts];
 function makePattern() {
   const p = new Uint8Array(ROWS * cellBytes);
   for (let r = 0; r < ROWS; r++) {

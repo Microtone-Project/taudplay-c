@@ -65,7 +65,7 @@ static void arm_mod_xfade(TaudEngine *e, int instId)
     }
 }
 
-static void restart_voice(TaudVoice *v)
+static void restart_voice(TaudEngine *e, TaudVoice *v)
 {
     v->samplePos = v->activeSamplePlayStart;
     v->keyOff = false;
@@ -93,6 +93,11 @@ static void restart_voice(TaudVoice *v)
     v->right.bitcrusherCounter = 0;
     v->right.bitcrusherHeld = 0.0;
     v->right.nesDpcmCounter = 63;
+    /* An OPL channel restarts the way the chip re-keys one: the attack from
+     * wherever each envelope stands, the phase from zero (§5.5.2). */
+    if (v->opl != NULL && v->opl->patch != NULL) te_opl_key_on(v->opl, v->opl->patch, true);
+    /* A voice sounding a formant instrument says its syllable again (item 212). */
+    if (v->formant != NULL) te_formant_restart(e, v->formant);
 }
 
 static void advance_sample_mod(TaudEngine *e, TaudVoice *voice)
@@ -377,7 +382,7 @@ void te_apply_tracker_tick(TaudEngine *e)
                     break;
                 }
                 te_apply_duplicate_check(e, vi, voice->delayedInst, voice->delayedNote);
-                te_maybe_spawn_background_for_nna(e, voice, vi);
+                te_maybe_spawn_background_for_nna(e, voice, vi, voice->delayedInst);
                 te_trigger_meta_or_note(e, voice, vi, voice->delayedNote, voice->delayedInst, voice->delayedVol);
                 break;
             }
@@ -525,9 +530,9 @@ void te_apply_tracker_tick(TaudEngine *e)
             voice->retrigCounter++;
             if (voice->retrigCounter >= voice->retrigInterval) {
                 voice->retrigCounter = 0;
-                restart_voice(voice);
+                restart_voice(e, voice);
                 for (i = 0; i < e->bgCount; i++) {
-                    if (te_is_sounding_child(e, e->bg[i], vi)) restart_voice(e->bg[i]);
+                    if (te_is_sounding_child(e, e->bg[i], vi)) restart_voice(e, e->bg[i]);
                 }
                 voice->noteVolume = te_apply_retrig_vol_mod(voice->noteVolume, voice->retrigVolMod, e->volStep, e->volMax);
                 voice->rowVolume = voice->noteVolume;

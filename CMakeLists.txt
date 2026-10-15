@@ -5,7 +5,7 @@ project(taudplay C)
 # no fused multiply-add, no fast-math.
 set(TAUDPLAY_SOURCES
     src/jsmath.c src/tables.c src/inst.c src/samplemod.c src/sampler.c
-    src/envelope.c src/filter.c src/fm.c src/spatial.c src/binaural.c
+    src/envelope.c src/filter.c src/fm.c src/opl.c src/formant.c src/spatial.c src/binaural.c
     src/hrir_sadie.c src/mastering.c src/trigger.c src/effects.c src/row.c
     src/tick.c src/mixer.c src/engine.c src/parse.c src/zstd.c src/inflate.c
     src/resample.c src/player.c)
@@ -23,9 +23,9 @@ if(MATH_LIB)
   target_link_libraries(taudplay PUBLIC ${MATH_LIB})
 endif()
 
-option(TAUDPLAY_FDLIBM_POW "Use the bundled fdlibm pow instead of the platform's" OFF)
-if(TAUDPLAY_FDLIBM_POW)
-  target_compile_definitions(taudplay PRIVATE TAUD_FDLIBM_POW)
+option(TAUDPLAY_LIBM_POW "Use the platform's pow instead of the bundled V8 one (not bit-exact)" OFF)
+if(TAUDPLAY_LIBM_POW)
+  target_compile_definitions(taudplay PRIVATE TAUD_LIBM_POW)
 endif()
 
 add_executable(taudplay-cli tools/taudplay.c)

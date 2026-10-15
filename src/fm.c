@@ -74,7 +74,7 @@ static double fm_eval_operator(TaudEngine *e, TaudFmRig *rig, int k, int interpM
         double effEnvVol;
         s = te_apply_voice_filter_self(v, s);
         v->envVolMix += v->envVolStep;
-        effEnvVol = v->volEnvOn ? v->envVolMix : 1.0;
+        effEnvVol = v->hasVolEnv && v->volEnvOn ? v->envVolMix : 1.0;
         te_advance_volume_ramp(e, v, e->volDiv);
         te_advance_pitch_ramp(e, v, spt);
         g *= effEnvVol * v->fadeoutVolume * v->activeAttenGain * (inst->instGlobalVolume / 255.0);
