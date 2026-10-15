@@ -37,8 +37,12 @@ void te_inst_free(TaudInst *inst)
 {
     free(inst->extraPatches);
     free(inst->meta);
+    free(inst->opl);
+    free(inst->formant);
     free(inst->invertMask);
     free(inst->modMask);
+    inst->opl = NULL;
+    inst->formant = NULL;
     inst->extraPatches = NULL;
     inst->patchCount = 0;
     inst->meta = NULL;
@@ -177,7 +181,9 @@ done:
 const TaudPatch *te_inst_resolve_patch(const TaudInst *inst, int noteVal, int rowVolume)
 {
     int i;
-    if (inst->extraPatches == NULL) return NULL;
+    /* An OPL instrument and a formant instrument have no keyboard map (§7.7,
+     * §7.8): a list a project carries for either is ignored on every path. */
+    if (inst->extraPatches == NULL || inst->opl != NULL || inst->formant != NULL) return NULL;
     for (i = 0; i < inst->patchCount; i++) {
         const TaudPatch *p = &inst->extraPatches[i];
         if (noteVal >= p->pitchStart && noteVal <= p->pitchEnd &&
@@ -309,7 +315,7 @@ static void inst_set_byte(TaudInst *t, int o, int byte)
     case 192: t->panEnvSustainWord = (t->panEnvSustainWord & 0x00ff) | (byte << 8); break;
     case 193: t->pfEnvSustainWord = (t->pfEnvSustainWord & 0xff00) | byte; break;
     case 194: t->pfEnvSustainWord = (t->pfEnvSustainWord & 0x00ff) | (byte << 8); break;
-    case 195: t->dupCheckFlag = byte & 0x0f; break;
+    case 195: t->dupCheckFlag = byte & 0xff; break;
     case 196: t->defaultNoteVolume = byte & 0xff; break;
     case 197: t->pf2EnvLoop = (t->pf2EnvLoop & 0xff00) | byte; break;
     case 198: t->pf2EnvLoop = (t->pf2EnvLoop & 0x00ff) | (byte << 8); break;
@@ -320,12 +326,64 @@ static void inst_set_byte(TaudInst *t, int o, int byte)
     }
 }
 
+/* An ordinary record read as one, except that bytes 0…3 are the type header
+ * and bytes 197…250 are the OPL patch or the tract block rather than a second
+ * pitch/filter envelope, which is therefore always absent. */
+static void load_typed_record(TaudInst *inst, const uint8_t *b)
+{
+    int i;
+    free(inst->meta);
+    inst->meta = NULL;
+    free(inst->extraPatches);
+    inst->extraPatches = NULL;
+    inst->patchCount = 0;
+    for (i = 4; i < 256; i++) {
+        if (i >= OPL_BLOCK_START && i < OPL_BLOCK_START + OPL_BLOCK_LEN) continue;
+        inst_set_byte(inst, i, b[i]);
+    }
+    inst->pf2EnvLoop = 0;
+    inst->pf2EnvSustainWord = 0;
+    make_env(inst->pf2Envelopes, 0x80);
+}
+
+static void load_opl_record(TaudInst *inst, const uint8_t *b)
+{
+    free(inst->formant);
+    inst->formant = NULL;
+    if (inst->opl == NULL) inst->opl = (TaudOplPatch *)calloc(1, sizeof *inst->opl);
+    if (inst->opl != NULL) te_decode_opl_patch(b + OPL_BLOCK_START, inst->opl);
+    inst->samplePtr = 0;
+    load_typed_record(inst, b);
+}
+
+static void load_formant_record(TaudInst *inst, const uint8_t *b)
+{
+    free(inst->opl);
+    inst->opl = NULL;
+    if (inst->formant == NULL) inst->formant = (TaudFormantPatch *)calloc(1, sizeof *inst->formant);
+    if (inst->formant != NULL) te_decode_formant_block(b + FORMANT_BLOCK_START, inst->formant);
+    inst->samplePtr = inst->formant != NULL ? inst->formant->srcPtr : 0;
+    load_typed_record(inst, b);
+}
+
 /** Load a full 256-byte record; detects the Metainstrument sentinel. */
 void te_inst_load_record(TaudInst *inst, const uint8_t *b)
 {
     uint32_t sp = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
     inst->cutoffOverride = -1;
     inst->resonanceOverride = -1;
+    if (((sp >> 16) & 0xffff) == 0xffff && ((b[0] >> 4) & 0x0f) == META_TYPE_OPL) {
+        load_opl_record(inst, b);
+        return;
+    }
+    if (((sp >> 16) & 0xffff) == 0xffff && ((b[0] >> 4) & 0x0f) == META_TYPE_FORMANT) {
+        load_formant_record(inst, b);
+        return;
+    }
+    free(inst->opl);
+    inst->opl = NULL;
+    free(inst->formant);
+    inst->formant = NULL;
     if (((sp >> 16) & 0xffff) == 0xffff) {
         int type = (b[0] >> 4) & 0x0f;
         bool fm = type == META_TYPE_FM;

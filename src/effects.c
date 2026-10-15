@@ -383,6 +383,14 @@ static void apply_s_effect(TaudEngine *e, TaudVoice *voice, int vi, int arg)
         }
         break;
     }
+    case 0xa:
+        /* S $Afgr — on a voice sounding a formant instrument (item 212), the
+         * vowel: openness f, frontness g, roundness r. The note's whole tract
+         * hears it, layer children included; elsewhere it does nothing. */
+        FOR_EACH_LAYER_TARGET(e, voice, vi, v, {
+            if (v->formant != NULL) te_formant_set_vowel(v->formant, x, (arg >> 4) & 0xf, arg & 0xf);
+        });
+        break;
     case 0x8:
         te_apply_pan_set(e, voice, arg & (e->ts_surroundModel == SURROUND_STEREO ? 0xff : 0x1ff));
         break;

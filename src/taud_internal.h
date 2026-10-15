@@ -274,7 +274,7 @@ typedef struct {
 #define FORMANT_BLOCK_START 197
 #define FORMANT_BLOCK_LEN 54
 #define FORMANT_SLOTS 3
-#define FORMANT_TRACK_MAX 32    /* doubles: 16 (time, value) points */
+#define FORMANT_TRACK_MAX 24    /* doubles: 12 (time, value) points; the longest track has 11 */
 #define NORM_HARMONICS 64
 
 typedef struct {
@@ -378,9 +378,7 @@ typedef struct TaudInst {
 
     TaudMeta *meta;             /* NULL unless a metainstrument */
     TaudOplPatch *opl;          /* NULL unless a type-8 OPL instrument */
-    uint8_t *oplRaw;
     TaudFormantPatch *formant;  /* NULL unless a type-1 formant instrument */
-    uint8_t *formantRaw;
 
     /* Invert loop (S $F0xx). invertMaskLen 0 = no mask. */
     uint8_t *invertMask;
@@ -781,6 +779,32 @@ void te_master_chain_process(TaudMasterChain *c, float *left, float *right, int 
 
 /* ── the engine (engine.js + state.js Playhead/TrackerState) ───────────── */
 
+/* formant.js's module-level tables, computed once per engine. The bank grid
+ * is built at the engine rate: formant.js builds it when the module loads,
+ * from the rate set by then (setSamplingRate before the import, as the
+ * reference harness does). */
+#define ISO226_N 29
+#define BANK_GRID_MAX 64
+#define SOURCE_DFT_MAX 4096
+typedef struct {
+    double logCard[4][4][2];
+    double elwLogF[ISO226_N], elwDb[ISO226_N];
+    int bankN;
+    double bankW[BANK_GRID_MAX], bankC1[BANK_GRID_MAX], bankS1[BANK_GRID_MAX];
+    double bankC2[BANK_GRID_MAX], bankS2[BANK_GRID_MAX];
+    double bankRef;
+    double dft[SOURCE_DFT_MAX];     /* scratch */
+    /* sourceHarmonics' memo: the same bytes measure the same. */
+    int memoCount;
+    struct {
+        int64_t p, N;
+        double m, P;
+        uint32_t h;
+        int K;
+        double w[NORM_HARMONICS + 1];
+    } memo[32];
+} TaudFormantTables;
+
 typedef struct TaudVoiceChunk {
     struct TaudVoiceChunk *next;
     int count;
@@ -866,6 +890,7 @@ typedef struct TaudEngine {
 
     /* Tables. */
     double sincTable[SINC_TABLE_SIZE];
+    TaudFormantTables formantTables;
 
     bool oom;                   /* an allocation failed on the render path */
 } TaudEngine;
@@ -894,6 +919,7 @@ void te_set_surround_model(TaudEngine *e, int model);
 void te_set_monitor_mode(TaudEngine *e, int mode);
 void te_set_mastering(TaudEngine *e, const TaudMastering *params);
 void te_set_cue_position(TaudEngine *e, int pos);
+void te_reset_play_state(TaudEngine *e);
 void te_set_tracker_row(TaudEngine *e, int row);
 void te_play(TaudEngine *e);
 void te_stop(TaudEngine *e);
@@ -1053,6 +1079,7 @@ void te_drop_fm_operators(TaudEngine *e, int vi);
 
 /* opl.c */
 void te_decode_opl_patch(const uint8_t *bytes, TaudOplPatch *into);
+void te_opl_state_init(TaudOplState *st);
 void te_opl_key_on(TaudOplState *st, const TaudOplPatch *patch, bool carry);
 void te_opl_key_off(TaudOplState *st);
 void te_opl_reattack(TaudOplState *st);
@@ -1063,7 +1090,9 @@ double te_render_opl_voice(TaudEngine *e, TaudVoice *v, int64_t frame);
 #define PHASE_VOWEL 1
 #define PHASE_CODA 2
 #define PHASE_DONE 3
+void te_formant_tables_init(TaudFormantTables *t, int rate);
 void te_decode_formant_block(const uint8_t *raw, TaudFormantPatch *patch);
+void te_formant_state_init(TaudFormantState *st);
 void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch);
 void te_formant_restart(TaudEngine *e, TaudFormantState *st);
 void te_formant_relatch(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch);
@@ -1113,7 +1142,7 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *v, int vi, int noteVal, i
 void te_trigger_note(TaudEngine *e, TaudVoice *v, int noteVal, int instId, int volOverride);
 int te_narrow_vol_axis(const TaudEngine *e, int v);
 void te_apply_duplicate_check(TaudEngine *e, int channel, int instId, int note);
-void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *v, int channel);
+void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *v, int channel, int incomingInst);
 void te_apply_past_note_action(TaudEngine *e, int channel, int action);
 void te_apply_vol_column(TaudEngine *e, TaudVoice *v, int value, int sel);
 void te_apply_pan_column(TaudEngine *e, TaudVoice *v, int value, int sel);
@@ -1126,6 +1155,7 @@ int te_apply_retrig_vol_mod(int vol, int x, int step, int max);
 /* row.c */
 void te_apply_tracker_row(TaudEngine *e);
 void te_advance_row(TaudEngine *e);
+void te_advance_row_position(TaudEngine *e);
 void te_reconstruct_ditto_state(TaudEngine *e, int startRow);
 
 /* tick.c */

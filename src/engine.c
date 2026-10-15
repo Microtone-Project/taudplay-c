@@ -478,13 +478,17 @@ void te_set_cue_position(TaudEngine *e, int pos)
     e->cuePos = e->position;
 }
 
-void te_set_tracker_row(TaudEngine *e, int row)
+/* The per-PLAY half of every reset that starts playback somewhere (§15,
+ * TrackerState.resetPlayState): the tick clock and the jump state, no voice
+ * sounding, the background pool empty, the interrupt latch clear, the OPL
+ * chip clock back at zero and the mastering chain's running state gone. */
+void te_reset_play_state(TaudEngine *e)
 {
     int i;
-    e->rowIndex = iclamp(row, 0, 63);
     e->tickInRow = 0;
     e->samplesIntoTick = 0.0;
     e->firstRow = true;
+    e->oplFrame = 0;
     e->pendingOrderJump = -1;
     e->pendingRowJump = -1;
     e->pendingRowJumpLocal = false;
@@ -494,9 +498,18 @@ void te_set_tracker_row(TaudEngine *e, int row)
     e->finePatternDelayExtra = 0;
     e->pendingInterrupts = 0;
     memset(e->interruptArgs, 0, sizeof e->interruptArgs);
+    for (i = 0; i < MAX_VOICES; i++) e->voices[i].active = false;
+    e->bgCount = 0;
+    if (e->mastering != NULL) te_master_chain_reset(e->mastering);
+}
+
+void te_set_tracker_row(TaudEngine *e, int row)
+{
+    int i;
+    e->rowIndex = iclamp(row, 0, 63);
+    te_reset_play_state(e);
     for (i = 0; i < MAX_VOICES; i++) {
         TaudVoice *v = &e->voices[i];
-        v->active = false;
         v->loopStartRow = 0; v->loopCount = 0;
         v->dittoActive = false; v->dittoSourceStart = 0; v->dittoLength = 0; v->dittoEndRow = 0;
         v->channelVolume = e->volMax;
@@ -524,8 +537,6 @@ void te_set_tracker_row(TaudEngine *e, int row)
         v->nnaOverride = -1;
         v->volEnvOn = true; v->panEnvOn = true; v->pitchEnvOn = true; v->filterEnvOn = true;
     }
-    e->bgCount = 0;
-    if (e->mastering != NULL) te_master_chain_reset(e->mastering);
     te_reconstruct_ditto_state(e, e->rowIndex);
 }
 
@@ -604,6 +615,7 @@ TaudEngine *te_engine_new(int rate)
     if (e->attackRampSamples < 1) e->attackRampSamples = 1;
     if (e->rampOutSamples < 1) e->rampOutSamples = 1;
     te_build_tables(e);
+    te_formant_tables_init(&e->formantTables, rate);
 
     e->instruments = (TaudInst *)calloc(NUM_INST_SLOTS, sizeof(TaudInst));
     e->playdata = (TaudCell **)calloc(NUM_PATTERNS, sizeof(TaudCell *));

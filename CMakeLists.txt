@@ -5,7 +5,7 @@ project(taudplay C)
 # no fused multiply-add, no fast-math.
 set(TAUDPLAY_SOURCES
     src/jsmath.c src/tables.c src/inst.c src/samplemod.c src/sampler.c
-    src/envelope.c src/filter.c src/fm.c src/spatial.c src/binaural.c
+    src/envelope.c src/filter.c src/fm.c src/opl.c src/formant.c src/spatial.c src/binaural.c
     src/hrir_sadie.c src/mastering.c src/trigger.c src/effects.c src/row.c
     src/tick.c src/mixer.c src/engine.c src/parse.c src/zstd.c src/inflate.c
     src/resample.c src/player.c)

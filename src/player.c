@@ -270,7 +270,9 @@ double taud_get_voice_volume(const TaudPlayer *p, int v)
     if (v < 0 || v >= MAX_VOICES) return 0;
     voice = &p->engine->voices[v];
     if (!voice->active) return 0;
-    effEnvVol = voice->hasVolEnv && voice->volEnvOn ? voice->envVolMix : 1.0;
+    /* render.js's own reading, which (unlike the engine's internal probe)
+     * does not consult the envelope's P bit. */
+    effEnvVol = voice->volEnvOn ? voice->envVolMix : 1.0;
     faderGain = (255 - voice->fader) / 255.0;
     ev = effEnvVol * voice->fadeoutVolume * voice->currentMixVolume * faderGain;
     return ev < 0 ? 0 : ev > 1 ? 1 : ev;

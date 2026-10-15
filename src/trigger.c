@@ -91,7 +91,9 @@ void te_apply_active_sample(TaudVoice *v, const TaudInst *inst, const TaudPatch 
         v->activeSamplePlayStart = inst->samplePlayStart;
         v->activeSampleLoopStart = inst->sampleLoopStart;
         v->activeSampleLoopEnd = inst->sampleLoopEnd;
-        v->activeSamplingRate = inst->samplingRate;
+        /* An OPL instrument's rate is its C2SPD; 0 plays at the tracker
+         * convention (§7.7) — the pitch has to come from somewhere. */
+        v->activeSamplingRate = inst->opl != NULL && inst->samplingRate == 0 ? OPL_C4_RATE : inst->samplingRate;
         v->activeSampleDetune = inst_sample_detune_signed(inst);
         v->activeLoopMode = inst->loopMode;
         v->activeVibratoSpeed = inst->vibratoSpeed;
@@ -220,7 +222,10 @@ static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, int noteVal
 
 static bool fm_sounds(TaudEngine *e, const TaudMetaLayer *o, int noteVal, int seedVol)
 {
+    /* An OPL instrument is a channel, not a waveform a rack can read (§7.7);
+     * a formant instrument is a sound made of a waveform, not one (§7.8). */
     return o->instIdx >= 1 && o->instIdx <= 1023 && !inst_is_meta(&e->instruments[o->instIdx]) &&
+        !inst_is_opl(&e->instruments[o->instIdx]) && !inst_is_formant(&e->instruments[o->instIdx]) &&
         noteVal >= o->pitchStart && noteVal <= o->pitchEnd &&
         seedVol >= o->volStart && seedVol <= o->volEnd;
 }
@@ -396,9 +401,15 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
 {
     bool mayCarry = voice->active && !voice->keyOff && !voice->noteFading &&
         (instId == 0 || instId == voice->instrumentId);
+    /* An OPL channel handed over by te_maybe_spawn_background_for_nna (a
+     * retrigger the New Note Action cuts) keeps its envelopes, as the chip
+     * does — read before anything below marks the voice active. */
+    bool oplCarry = voice->oplCarry && voice->active && voice->opl != NULL;
     const TaudInst *inst;
     const TaudPatch *patch;
     int seedVolForLookup;
+
+    voice->oplCarry = false;
 
     if (instId != 0) voice->instrumentId = instId;
     inst = &e->instruments[voice->instrumentId];
@@ -440,7 +451,8 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
     voice->fadeoutVolume = 1.0;
     voice->rampOutSamples = 0;
     voice->rampOutGain = 0.0;
-    voice->attackRampSamples = e->attackRampSamples;
+    /* Not on an OPL voice: its attack IS the chip's envelope. */
+    voice->attackRampSamples = inst->opl != NULL ? 0 : e->attackRampSamples;
     voice->autoVibPhase = 0;
     voice->autoVibTicksSinceTrigger = 0;
     voice->nesDpcmCounter = 63;
@@ -512,6 +524,20 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
     voice->metaForeground = false;
     voice->metaForegroundDetune = 0;
     voice->fmRig = NULL;
+    /* The OPL channel (item 209): keyed on here, carried or fresh. */
+    if (inst->opl != NULL) {
+        if (voice->opl == NULL) { voice->opl = &voice->oplStore; te_opl_state_init(voice->opl); }
+        te_opl_key_on(voice->opl, inst->opl, oplCarry);
+    } else {
+        voice->opl = NULL;
+    }
+    /* A formant instrument (item 212): every trigger is a fresh syllable. */
+    if (inst->formant != NULL) {
+        if (voice->formant == NULL) { voice->formant = &voice->formantStore; te_formant_state_init(voice->formant); }
+        te_formant_note_on(e, voice->formant, inst->formant);
+    } else {
+        voice->formant = NULL;
+    }
     if (voice->vibratoRetrig) voice->vibratoLfoPos = 0;
     if (voice->tremoloRetrig) voice->tremoloLfoPos = 0;
     if (voice->panbrelloRetrig) voice->panbrelloLfoPos = 0;
@@ -534,23 +560,46 @@ static void principal_of(TaudEngine *e, int instId, int note, int *outInst, int 
 
 typedef struct { int newInstId, newNote; uint32_t newSmpPtr; int newSmpLen; } DupKey;
 
-static bool is_duplicate(TaudEngine *e, const TaudVoice *v, const DupKey *k)
+static bool is_duplicate(TaudEngine *e, const TaudVoice *v, const DupKey *k, bool bare)
 {
     const TaudInst *existInst = &e->instruments[v->instrumentId];
+    const TaudInst *newInst = &e->instruments[k->newInstId];
+    /* A formant voice already into its coda, or ramping out, is no duplicate:
+     * what the check ends is the VOWEL. */
+    if (v->formant != NULL && (v->formant->phase >= PHASE_CODA || v->rampOutSamples > 0)) return false;
+    if (bare && inst_dup_check_type(existInst) != DCT_LANE) return false;
     switch (inst_dup_check_type(existInst)) {
     case 1: return v->noteVal == k->newNote && v->instrumentId == k->newInstId;
-    case 2: return v->instrumentId == k->newInstId && v->activeSamplePtr == k->newSmpPtr &&
-                   v->activeSampleLength == k->newSmpLen;
+    case 2:
+        /* Formant instruments' "sample" is the pool range they are made from. */
+        if (v->formant != NULL && existInst->formant != NULL && newInst->formant != NULL) {
+            return existInst->formant->rangeLo == newInst->formant->rangeLo &&
+                   existInst->formant->rangeHi == newInst->formant->rangeHi;
+        }
+        return v->instrumentId == k->newInstId && v->activeSamplePtr == k->newSmpPtr &&
+               v->activeSampleLength == k->newSmpLen;
     case 3: return v->instrumentId == k->newInstId;
+    case DCT_LANE: return true;
     default: return false;
     }
 }
 
-static void apply_dup_action(TaudEngine *e, TaudVoice *v)
+static TaudVoice *ghost_rig(TaudEngine *e, TaudVoice *voice, int channel);
+
+static void apply_dup_action(TaudEngine *e, TaudVoice *v, bool isFg, int channel)
 {
     const TaudInst *existInst = &e->instruments[v->instrumentId];
     switch (inst_dup_check_action(existInst)) {
-    case 0: v->fadeoutVolume = 0.0; v->active = false; break;
+    case 0:
+        if (v->formant != NULL) {
+            /* Ramped out over the incoming note's attack: the foreground voice
+             * through a ghost, since the note is about to reuse it. */
+            TaudVoice *r = isFg ? ghost_rig(e, v, channel) : v;
+            if (r != NULL) te_start_cut_ramp(e, r);
+            if (isFg) { v->active = false; te_cap_background_voices(e); }
+            break;
+        }
+        v->fadeoutVolume = 0.0; v->active = false; break;
     case 1: v->keyOff = true; te_apply_key_lift(v, existInst); break;
     case 2: v->noteFading = true; break;
     default: break;
@@ -564,6 +613,10 @@ void te_apply_duplicate_check(TaudEngine *e, int channel, int instId, int note)
     const TaudPatch *newPatch;
     TaudVoice *fg;
     int i;
+    /* Type 4, Lane (item 216): a note with no instrument byte is checked too,
+     * against the lane's instrument; types 1-3 ask only about a named one. */
+    bool bare = instId == 0;
+    if (bare) instId = e->voices[channel].instrumentId;
     if (instId == 0) return;
     principal_of(e, instId, note, &k.newInstId, &k.newNote);
     newInst = &e->instruments[k.newInstId];
@@ -572,16 +625,16 @@ void te_apply_duplicate_check(TaudEngine *e, int channel, int instId, int note)
     k.newSmpLen = newPatch != NULL ? newPatch->sampleLength : newInst->sampleLength;
 
     fg = &e->voices[channel];
-    if (fg->active && inst_dup_check_type(&e->instruments[fg->instrumentId]) != 0 && is_duplicate(e, fg, &k)) {
-        apply_dup_action(e, fg);
+    if (fg->active && inst_dup_check_type(&e->instruments[fg->instrumentId]) != 0 && is_duplicate(e, fg, &k, bare)) {
+        apply_dup_action(e, fg, true, channel);
     }
     for (i = e->bgCount - 1; i >= 0; i--) {
         TaudVoice *bg = e->bg[i];
         if (bg->sourceChannel != channel || !bg->active) continue;
         if (bg->fmOperator) continue;
         if (inst_dup_check_type(&e->instruments[bg->instrumentId]) == 0) continue;
-        if (!is_duplicate(e, bg, &k)) continue;
-        apply_dup_action(e, bg);
+        if (!is_duplicate(e, bg, &k, bare)) continue;
+        apply_dup_action(e, bg, false, channel);
         if (!bg->active) te_bg_remove_at(e, i);
     }
 }
@@ -715,6 +768,11 @@ static TaudVoice *ghost_voice(TaudEngine *e, const TaudVoice *src, int channel)
     v->activeDefaultCutoff = src->activeDefaultCutoff;
     v->activeDefaultResonance = src->activeDefaultResonance;
     v->activeAttenGain = src->activeAttenGain;
+    /* An OPL channel is the voice's whole sound and state: the ghost takes a
+     * copy, clock and envelopes and all. A formant ghost keeps saying the
+     * syllable it was saying, into its coda once released. */
+    if (src->opl != NULL) { v->oplStore = src->oplStore; v->opl = &v->oplStore; }
+    if (src->formant != NULL) { v->formantStore = src->formantStore; v->formant = &v->formantStore; }
     return v;
 }
 
@@ -751,12 +809,19 @@ static TaudVoice *ghost_rig(TaudEngine *e, TaudVoice *voice, int channel)
     return bg;
 }
 
-void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *voice, int channel)
+void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *voice, int channel, int incomingInst)
 {
     int nna;
     TaudVoice *bg;
     if (!voice->active) return;
     nna = voice->nnaOverride >= 0 ? voice->nnaOverride : inst_new_note_action(&e->instruments[voice->instrumentId]);
+    if (nna == 1 && voice->opl != NULL && voice->fmRig == NULL &&
+        inst_is_opl(&e->instruments[incomingInst != 0 ? incomingInst : voice->instrumentId])) {
+        /* An OPL note cut by an OPL note is a retrigger of the same channel
+         * (§5.5.2): no ghost, no ramp; te_trigger_note picks it up. */
+        voice->oplCarry = true;
+        return;
+    }
     if (nna == 1) {
         bg = ghost_rig(e, voice, channel);
         if (bg != NULL) te_start_cut_ramp(e, bg);

@@ -34,6 +34,32 @@ static void apply_instrument_change(TaudEngine *e, TaudVoice *v, const TaudInst 
 {
     int seedVol;
     te_apply_active_sample(v, newInst, newPatch);
+    /* An OPL voice takes the new patch onto the channel it is sounding; on a
+     * porta row the instrument byte re-attacks its envelopes without
+     * restarting the phase (§5.5.2). A sampled note handed an OPL instrument
+     * gets a fresh channel, keyed at the note it is already playing. */
+    if (newInst->opl != NULL && v->opl != NULL) {
+        v->opl->patch = newInst->opl;
+        v->opl->gen = -1;
+        if (reAttack) te_opl_reattack(v->opl);
+    } else if (newInst->opl != NULL) {
+        v->opl = &v->oplStore;
+        te_opl_state_init(v->opl);
+        te_opl_key_on(v->opl, newInst->opl, false);
+    } else {
+        v->opl = NULL;
+    }
+    /* A formant voice keeps saying its syllable under the new record's tract;
+     * a sampled note handed one starts its tract at the vowel. */
+    if (newInst->formant != NULL && v->formant != NULL) {
+        te_formant_relatch(e, v->formant, newInst->formant);
+    } else if (newInst->formant != NULL) {
+        v->formant = &v->formantStore;
+        te_formant_state_init(v->formant);
+        te_formant_start_at_vowel(e, v->formant, newInst->formant);
+    } else {
+        v->formant = NULL;
+    }
     seedVol = te_row_volume_from_default(newInst, newPatch, e->volMax);
     v->noteVolume = seedVol;
     v->rowVolume = seedVol;
@@ -188,7 +214,7 @@ void te_apply_tracker_row(TaudEngine *e)
             if (row->instrment != 0 && pitchFx && voice->noteVal >= 0x20) {
                 int trigVol = row->volumeEff == 0 ? row->volume : -1;
                 te_apply_duplicate_check(e, vi, row->instrment, voice->noteVal);
-                te_maybe_spawn_background_for_nna(e, voice, vi);
+                te_maybe_spawn_background_for_nna(e, voice, vi, row->instrment);
                 te_trigger_meta_or_note(e, voice, vi, voice->noteVal, row->instrment, trigVol);
             } else if (row->instrment != 0 && !inst_is_meta(&e->instruments[row->instrment])) {
                 const TaudInst *newInst;
@@ -254,7 +280,7 @@ void te_apply_tracker_row(TaudEngine *e)
             } else {
                 int trigVol = row->volumeEff == 0 ? row->volume : -1;
                 te_apply_duplicate_check(e, vi, row->instrment, note);
-                te_maybe_spawn_background_for_nna(e, voice, vi);
+                te_maybe_spawn_background_for_nna(e, voice, vi, row->instrment);
                 te_trigger_meta_or_note(e, voice, vi, note, row->instrment, trigVol);
                 schedule_dxny_action(voice, sArg, sDelayTick);
             }
@@ -357,12 +383,20 @@ static void reset_pattern_loop_state(TaudEngine *e)
 /* Advance to the next row: pending B/C jumps and pattern-delay repeats. */
 void te_advance_row(TaudEngine *e)
 {
+    te_advance_row_position(e);
+    te_apply_tracker_row(e);
+}
+
+/* advanceRow's first half: move to the row that plays next — the same row
+ * again while a pattern delay repeats it, else wherever a pending jump or the
+ * cue's end sends it — without applying it. */
+void te_advance_row_position(TaudEngine *e)
+{
     int pendingB, pendingC;
     bool pendingLocal;
     if (e->patternDelayRemaining > 0) {
         e->patternDelayRemaining--;
         e->patternDelayActive = true;
-        te_apply_tracker_row(e);
         return;
     }
     e->patternDelayActive = false;
@@ -393,5 +427,4 @@ void te_advance_row(TaudEngine *e)
             reset_pattern_loop_state(e);
         }
     }
-    te_apply_tracker_row(e);
 }

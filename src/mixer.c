@@ -8,9 +8,29 @@
 #define PI 3.141592653589793
 
 /* One voice's contribution as a [left, right] pair, before pan and gain. */
-static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode, double spt, double out[2])
+static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode, double spt,
+                              double out[2], int n)
 {
     double s, c0, c1;
+    /* An OPL channel (item 209) replaces the sample fetch, reading the chip
+     * clock at this frame; it has applied the note volume itself. */
+    if (v->opl != NULL) {
+        s = te_render_opl_voice(e, v, e->oplFrame + n);
+        s = te_apply_voice_filter_self(v, s);
+        s = te_apply_taud_voice_fx(v, s, &v->bitcrusherCounter, &v->bitcrusherHeld);
+        out[0] = s;
+        out[1] = s;
+        return;
+    }
+    /* A formant voice (item 212) plays its sample through the tract. */
+    if (v->formant != NULL) {
+        s = te_render_formant_voice(e, v, inst, interpMode);
+        s = te_apply_voice_filter_self(v, s);
+        s = te_apply_taud_voice_fx(v, s, &v->bitcrusherCounter, &v->bitcrusherHeld);
+        out[0] = s;
+        out[1] = s;
+        return;
+    }
     if (v->fmRig != NULL) {
         s = te_render_fm_voice(e, v, interpMode, spt);
         s = te_apply_voice_filter_self(v, s);
@@ -148,7 +168,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
             if (!voice->active || voice->fader == 255) continue;
             inst = &e->instruments[voice->instrumentId];
             te_advance_sample_mod_extended(e, voice, spt);
-            render_voice_pair(e, voice, inst, e->interpolationMode, spt, pair);
+            render_voice_pair(e, voice, inst, e->interpolationMode, spt, pair, n);
             sL = pair[0];
             sR = pair[1];
             instGv = inst->instGlobalVolume / 255.0;
@@ -158,7 +178,8 @@ bool te_generate_tracker_audio(TaudEngine *e)
             te_advance_volume_ramp(e, voice, e->volDiv);
             te_advance_pitch_ramp(e, voice, spt);
             faderGain = (255 - voice->fader) / 255.0;
-            perVoiceGain = effEnvVol * voice->fadeoutVolume * voice->currentMixVolume *
+            /* An OPL voice took its note volume into the operators. */
+            perVoiceGain = effEnvVol * voice->fadeoutVolume * (voice->opl != NULL ? 1.0 : voice->currentMixVolume) *
                 swingScale * instGv * faderGain * voice->layerMixGain * voice->activeAttenGain;
             vol = perVoiceGain * globalGain;
             if (spatial == NULL) {
@@ -210,7 +231,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
             if (!bg->active || bgFader == 255) continue;
             inst = &e->instruments[bg->instrumentId];
             if (bg->isLayerChild) te_advance_sample_mod_extended(e, bg, spt);
-            render_voice_pair(e, bg, inst, e->interpolationMode, spt, pair);
+            render_voice_pair(e, bg, inst, e->interpolationMode, spt, pair, n);
             sL = pair[0];
             sR = pair[1];
             instGv = inst->instGlobalVolume / 255.0;
@@ -220,7 +241,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
             te_advance_volume_ramp(e, bg, e->volDiv);
             te_advance_pitch_ramp(e, bg, spt);
             faderGain = (255 - bgFader) / 255.0;
-            vol = (effEnvVol * bg->fadeoutVolume * bg->currentMixVolume *
+            vol = (effEnvVol * bg->fadeoutVolume * (bg->opl != NULL ? 1.0 : bg->currentMixVolume) *
                    swingScale * gvol * mvol * instGv * faderGain * bg->layerMixGain * bg->activeAttenGain *
                    e->masterVolume) / 255.0;
             if (spatial == NULL) {
@@ -287,6 +308,8 @@ bool te_generate_tracker_audio(TaudEngine *e)
     }
 
     if (e->mastering != NULL) te_master_chain_process(e->mastering, e->mixLeft, e->mixRight, TRACKER_CHUNK);
+    /* The OPL chip clock (item 209) counts the frames this playhead has mixed. */
+    e->oplFrame += TRACKER_CHUNK;
     for (n = 0; n < TRACKER_CHUNK; n++) {
         float fl = e->mixLeft[n], fr = e->mixRight[n];
         if (fl < -1.0f) e->mixLeft[n] = -1.0f; else if (fl > 1.0f) e->mixLeft[n] = 1.0f;
