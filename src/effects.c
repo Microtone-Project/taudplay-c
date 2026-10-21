@@ -386,9 +386,14 @@ static void apply_s_effect(TaudEngine *e, TaudVoice *voice, int vi, int arg)
     case 0xa:
         /* S $Afgr — on a voice sounding a formant instrument (item 212), the
          * vowel: openness f, frontness g, roundness r. The note's whole tract
-         * hears it, layer children included; elsewhere it does nothing. */
+         * hears it, layer children included.
+         * S $Axxx — on a voice sounding a PSG instrument (§7.9), a register
+         * write into that INSTRUMENT's run-time overlay: auto-advance, level,
+         * mute, lasting until the next playback as invert loop's mask does.
+         * On any other instrument it does nothing. */
         FOR_EACH_LAYER_TARGET(e, voice, vi, v, {
             if (v->formant != NULL) te_formant_set_vowel(v->formant, x, (arg >> 4) & 0xf, arg & 0xf);
+            else if (v->psg != NULL && v->psg->patch != NULL) te_psg_write_register(v->psg->patch, arg & 0xfff);
         });
         break;
     case 0x8:

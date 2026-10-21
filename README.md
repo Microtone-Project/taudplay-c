@@ -184,7 +184,8 @@ All in [`include/taudplay.h`](include/taudplay.h).
   once at open, then trimmed to its last non-zero byte (a read past the end is
   0, which is what the full pool holds there), so a player keeps about 3 MB of
   its own state plus the song's actual sample data (each voice carries room for
-  an OPL channel and a formant tract, so a sounding one never allocates). Peak memory
+  an OPL channel, a PSG pair and a formant tract with a chip channel of its
+  own for a source, so a sounding one never allocates). Peak memory
   during `taud_open` is about 11 MB, while the full image is decompressed.
 - **Allocation on the render path.** None in steady state. The voice pool grows
   (in blocks of 64 voices) only when a note storm outgrows every earlier one,
@@ -222,13 +223,25 @@ also makes the output independent of the target's libm.
 
 `pow` follows V8's copy exactly, including the one place it groups the final
 step differently from Sun's original, which moves about 4% of results by an
-ulp. `-DTAUD_LIBM_POW` (CMake: `-DTAUDPLAY_LIBM_POW=ON`) uses the platform's
-`pow` instead: closer to correctly rounded, no longer bit-exact.
+ulp. Current V8 (14.x, as in Node 26) no longer calls that copy by default,
+though: with its `use_std_math_pow` flag on, the default, `Math.pow` and `**`
+are the platform's `std::pow`, so the JavaScript's own output now depends on
+the machine it runs on. V8 still computes its fdlibm port under
+`--no-use-std-math-pow`, and the tests run Node with that flag (`make check`
+and the scripts add it whenever Node knows it). A JS render made without it
+differs from this library's by an occasional one-ulp `pow` result, far below
+anything audible.
+
+`-DTAUD_LIBM_POW` (CMake: `-DTAUDPLAY_LIBM_POW=ON`) uses the platform's `pow`
+instead, which is bit-exact against a default V8 on the same machine where both
+call the same libm (verified on Linux with glibc 2.44 over the whole corpus),
+at the cost of the output's platform independence.
 
 ## Verification
 
 `make check` (needs Node ≥ 22 and a checkout of the JS library at
-`../microtone-taudplay`, or `JS=path`) runs:
+`../microtone-taudplay`, or `JS=path`; Node runs with `--no-use-std-math-pow`
+where it has the flag, see [Numerics](#numerics)) runs:
 
 - `tests/jsmath_check` — the math functions against V8.
 - `tests/run.sh` — every song of every corpus file, stereo fold-down and
@@ -241,15 +254,18 @@ ulp. `-DTAUD_LIBM_POW` (CMake: `-DTAUDPLAY_LIBM_POW=ON`) uses the platform's
 - `tests/fuzz.sh` — differential fuzzing: `tests/gen_fuzz.mjs` writes random but
   valid songs (both cell formats, 32/64 lanes, stereo/planar/spatial, envelopes,
   IT/SF2 filters, NNA and duplicate checks including the lane check, Ixmp
-  patches including stereo ones, layered and FM metainstruments, OPL channels
-  of every kind, formant instruments with every consonant manner, every effect
-  command, mastering chains), and both implementations must render them
-  identically. `FUZZ_INSTS=opl` or `formant` narrows the patterns to one kind;
-  `FUZZ_WILD=1` fills the OPL and formant blocks with random bytes.
+  patches including stereo ones, layered and FM metainstruments with chip
+  operators among them, table kinds the engine does not know, OPL channels of
+  every kind, PSG pairs of every waveform with their `S $Axxx` register writes,
+  formant instruments with every consonant manner — syllabic, nasalised,
+  glottalised, sung from a sample or from a chip — every effect command,
+  mastering chains), and both implementations must render them identically.
+  `FUZZ_INSTS=opl`, `psg`, `formant` or `fm` narrows the patterns to one kind;
+  `FUZZ_WILD=1` fills the OPL, PSG and formant blocks with random bytes.
 
-At the time of writing all of it is bit-identical: the thirteen files of the
-Microtone corpus and demos (every song, both monitor modes), and hundreds of
-fuzzed songs.
+At the time of writing all of it is bit-identical against Node 26 (V8 14.6):
+the sixteen files of the Microtone corpus and demos (every song, both monitor
+modes), and hundreds of fuzzed songs.
 
 ## Relationship to the JS library
 
@@ -258,10 +274,11 @@ and `src/taudplay/render.js` — the `TaudRenderer` half. The browser half
 (`TaudPlayer`, the AudioWorklet) has no C counterpart: its job, pulling blocks
 from an audio callback, is `taud_render`. Source files mirror the JS modules one
 for one (`sampler.c` is `sampler.js`, `tick.c` is `tick.js`, `opl.c` is
-`opl.js`, `formant.c` is `formant.js`, …) and keep their function names, so the
-two can be diffed when the engine moves.
+`opl.js`, `psg.c` is `psg.js`, `formant.c` is `formant.js`, …) and keep their
+function names, so the two can be diffed when the engine moves. (`chip.js`,
+which dispatches between the two chip kinds, is folded into `formant.c`.)
 
-In step with taudplay 3.11.0 (Microtone.js 3.11.0, engine d5d04cb272b7). The
+In step with taudplay 3.13.1 (Microtone.js 3.13.1, engine 059e9a209c32). The
 engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
 `TaudRenderer` this library mirrors does not use it, and seeking here is
 `taud_seek_cue`, as it is there.

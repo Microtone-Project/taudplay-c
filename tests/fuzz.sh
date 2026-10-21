@@ -3,6 +3,11 @@
 # JS library and the C port, and require bit-identical output.
 #   sh tests/fuzz.sh FIRST_SEED LAST_SEED [SECONDS]
 JS=${JS:-../microtone-taudplay}
+# Current V8 computes Math.pow with the platform's libm (std::pow) unless told
+# --no-use-std-math-pow, which keeps its own fdlibm pow — the one this library
+# carries. Older Node has no such flag and computes fdlibm's anyway.
+NODE=${NODE:-node}
+$NODE --no-use-std-math-pow -e 0 2>/dev/null && NODE="$NODE --no-use-std-math-pow"
 OUT=tests/out/fuzz
 mkdir -p "$OUT"
 first=${1:-1}; last=${2:-20}; secs=${3:-20}
@@ -16,7 +21,7 @@ while [ "$s" -le "$last" ]; do
   while [ "$k" -lt "$n" ]; do
     for mode in fold binaural; do
       extra=""; [ "$mode" = binaural ] && extra="--binaural"
-      node tests/ref_render.mjs "$JS" "$f" "$k" "$secs" "$OUT/r.f32" $mode 2>"$OUT/r.err" || { echo "seed $s song $k ($mode): JS failed: $(tail -1 $OUT/r.err)"; continue; }
+      $NODE tests/ref_render.mjs "$JS" "$f" "$k" "$secs" "$OUT/r.f32" $mode 2>"$OUT/r.err" || { echo "seed $s song $k ($mode): JS failed: $(tail -1 $OUT/r.err)"; continue; }
       ./taudplay "$f" -s "$k" -t "$secs" --raw "$OUT/c.f32" $extra 2>/dev/null || { echo "seed $s song $k ($mode): C failed"; fail=1; continue; }
       printf 'seed %s song %s (%s):' "$s" "$k" "$mode"
       ./tests/compare "$OUT/r.f32" "$OUT/c.f32" || fail=1

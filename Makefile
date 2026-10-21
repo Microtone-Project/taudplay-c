@@ -13,7 +13,7 @@ CFLAGS  += -std=c99 -Wall -Wextra -ffp-contract=off -Iinclude
 LDLIBS  += -lm
 
 SRCS = src/jsmath.c src/tables.c src/inst.c src/samplemod.c src/sampler.c src/envelope.c \
-       src/filter.c src/fm.c src/opl.c src/formant.c src/spatial.c src/binaural.c src/hrir_sadie.c \
+       src/filter.c src/fm.c src/opl.c src/psg.c src/formant.c src/spatial.c src/binaural.c src/hrir_sadie.c \
        src/mastering.c src/trigger.c src/effects.c src/row.c src/tick.c \
        src/mixer.c src/engine.c src/parse.c src/zstd.c src/inflate.c \
        src/resample.c src/player.c
@@ -38,10 +38,16 @@ tests/jsmath_check: tests/jsmath_check.c src/jsmath.c
 
 # Differential tests against the JavaScript library (needs Node and a
 # checkout of microtone-taudplay; JS=path overrides ../microtone-taudplay).
+# Current V8's Math.pow is the platform's std::pow unless Node is run with
+# --no-use-std-math-pow, which keeps V8's own fdlibm pow, the one jsmath.c
+# carries (the scripts add the flag themselves where Node knows it).
 JS ?= ../microtone-taudplay
+NODE ?= node
+export NODE
+NODE_POW := $(shell $(NODE) --no-use-std-math-pow -e 0 >/dev/null 2>&1 && echo --no-use-std-math-pow)
 check: all tests/compare tests/scenario tests/jsmath_check
 	mkdir -p tests/out
-	node tests/jsmath_ref.mjs 200000 > tests/out/jsmath.bin && ./tests/jsmath_check tests/out/jsmath.bin
+	$(NODE) $(NODE_POW) tests/jsmath_ref.mjs 200000 > tests/out/jsmath.bin && ./tests/jsmath_check tests/out/jsmath.bin
 	JS=$(JS) sh tests/run.sh
 	JS=$(JS) sh tests/scenario.sh $(JS)/test/corpus/WHEN.taud 48000 0
 	JS=$(JS) sh tests/scenario.sh $(JS)/test/corpus/slumberjack.taud 44100 1
@@ -50,6 +56,8 @@ check: all tests/compare tests/scenario tests/jsmath_check
 	JS=$(JS) sh tests/scenario.sh tests/out/formant.taud 44100 0
 	FUZZ_INSTS=opl node tests/gen_fuzz.mjs $(JS) 6 tests/out/opl.taud
 	JS=$(JS) sh tests/scenario.sh tests/out/opl.taud 22050 1
+	FUZZ_INSTS=psg node tests/gen_fuzz.mjs $(JS) 5 tests/out/psg.taud
+	JS=$(JS) sh tests/scenario.sh tests/out/psg.taud 32000 0
 
 clean:
 	rm -f $(OBJS) libtaudplay.a taudplay tests/compare tests/scenario tests/robust tests/jsmath_check

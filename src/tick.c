@@ -65,6 +65,32 @@ static void arm_mod_xfade(TaudEngine *e, int instId)
     }
 }
 
+/* One quarter tick of every sounding PSG pair's auto-advance — a lane's, a
+ * ghost's, an FM operator's (§5.5.4). Quarter 0 is the tick pass's; 1…3 are
+ * the mixer's, at the frames a quarter of the tick apart. */
+void te_psg_quarter_pass(TaudEngine *e)
+{
+    int i;
+    for (i = 0; i < MAX_VOICES; i++) {
+        TaudVoice *v = &e->voices[i];
+        if (v->psg != NULL && v->active) te_psg_quarter_tick(v->psg);
+    }
+    for (i = 0; i < e->bgCount; i++) {
+        TaudVoice *v = e->bg[i];
+        if (v->psg != NULL && v->active) te_psg_quarter_tick(v->psg);
+    }
+}
+
+/* Whether any voice is sounding a PSG pair: the mixer runs quarters only then. */
+bool te_psg_live(const TaudEngine *e)
+{
+    int i;
+    if (!e->hasPsg) return false;
+    for (i = 0; i < MAX_VOICES; i++) if (e->voices[i].psg != NULL && e->voices[i].active) return true;
+    for (i = 0; i < e->bgCount; i++) if (e->bg[i]->psg != NULL && e->bg[i]->active) return true;
+    return false;
+}
+
 static void restart_voice(TaudEngine *e, TaudVoice *v)
 {
     v->samplePos = v->activeSamplePlayStart;
@@ -96,6 +122,9 @@ static void restart_voice(TaudEngine *e, TaudVoice *v)
     /* An OPL channel restarts the way the chip re-keys one: the attack from
      * wherever each envelope stands, the phase from zero (§5.5.2). */
     if (v->opl != NULL && v->opl->patch != NULL) te_opl_key_on(v->opl, v->opl->patch, true);
+    /* …and a PSG pair the same way; an oscillator with its X flag set
+     * restarts its internal status here too, as at any key-on (§5.5.4). */
+    if (v->psg != NULL && v->psg->patch != NULL) te_psg_key_on(v->psg, v->psg->patch, true);
     /* A voice sounding a formant instrument says its syllable again (item 212). */
     if (v->formant != NULL) te_formant_restart(e, v->formant);
 }
@@ -581,6 +610,11 @@ void te_apply_tracker_tick(TaudEngine *e)
             }
         }
     }
+
+    /* PSG waveform auto-advance (§5.5.4): the tick's first quarter. The mixer
+     * runs the other three at their own frames. */
+    e->psgQuarter = 0;
+    te_psg_quarter_pass(e);
 
     /* Invert loop (S $F0xx). */
     for (vi = 0; vi < MAX_VOICES; vi++) {

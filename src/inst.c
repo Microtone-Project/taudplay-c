@@ -38,10 +38,12 @@ void te_inst_free(TaudInst *inst)
     free(inst->extraPatches);
     free(inst->meta);
     free(inst->opl);
+    free(inst->psg);
     free(inst->formant);
     free(inst->invertMask);
     free(inst->modMask);
     inst->opl = NULL;
+    inst->psg = NULL;
     inst->formant = NULL;
     inst->extraPatches = NULL;
     inst->patchCount = 0;
@@ -181,9 +183,9 @@ done:
 const TaudPatch *te_inst_resolve_patch(const TaudInst *inst, int noteVal, int rowVolume)
 {
     int i;
-    /* An OPL instrument and a formant instrument have no keyboard map (§7.7,
-     * §7.8): a list a project carries for either is ignored on every path. */
-    if (inst->extraPatches == NULL || inst->opl != NULL || inst->formant != NULL) return NULL;
+    /* An OPL, PSG or formant instrument has no keyboard map (§7.8, §7.9,
+     * §7.6): a list a project carries for one is ignored on every path. */
+    if (inst->extraPatches == NULL || inst->opl != NULL || inst->psg != NULL || inst->formant != NULL) return NULL;
     for (i = 0; i < inst->patchCount; i++) {
         const TaudPatch *p = &inst->extraPatches[i];
         if (noteVal >= p->pitchStart && noteVal <= p->pitchEnd &&
@@ -327,8 +329,8 @@ static void inst_set_byte(TaudInst *t, int o, int byte)
 }
 
 /* An ordinary record read as one, except that bytes 0…3 are the type header
- * and bytes 197…250 are the OPL patch or the tract block rather than a second
- * pitch/filter envelope, which is therefore always absent. */
+ * and bytes 197…250 are the OPL or PSG patch or the tract block rather than a
+ * second pitch/filter envelope, which is therefore always absent. */
 static void load_typed_record(TaudInst *inst, const uint8_t *b)
 {
     int i;
@@ -350,8 +352,31 @@ static void load_opl_record(TaudInst *inst, const uint8_t *b)
 {
     free(inst->formant);
     inst->formant = NULL;
+    free(inst->psg);
+    inst->psg = NULL;
     if (inst->opl == NULL) inst->opl = (TaudOplPatch *)calloc(1, sizeof *inst->opl);
     if (inst->opl != NULL) te_decode_opl_patch(b + OPL_BLOCK_START, inst->opl);
+    inst->samplePtr = 0;
+    load_typed_record(inst, b);
+}
+
+/* Type 9, laid out as type 8. The decoded patch is reused across reloads, so
+ * the S $Axxx overlay it carries survives one, as invert loop's mask does. */
+static void load_psg_record(TaudInst *inst, const uint8_t *b)
+{
+    free(inst->formant);
+    inst->formant = NULL;
+    free(inst->opl);
+    inst->opl = NULL;
+    if (inst->psg == NULL) {
+        inst->psg = (TaudPsgPatch *)calloc(1, sizeof *inst->psg);
+        if (inst->psg != NULL) {
+            inst->psg->rtAdvance[0] = inst->psg->rtAdvance[1] = -1;
+            inst->psg->rtLevel[0] = inst->psg->rtLevel[1] = -1;
+            inst->psg->rtMute = -1;
+        }
+    }
+    if (inst->psg != NULL) te_decode_psg_patch(b + PSG_BLOCK_START, inst->psg);
     inst->samplePtr = 0;
     load_typed_record(inst, b);
 }
@@ -360,8 +385,15 @@ static void load_formant_record(TaudInst *inst, const uint8_t *b)
 {
     free(inst->opl);
     inst->opl = NULL;
+    free(inst->psg);
+    inst->psg = NULL;
     if (inst->formant == NULL) inst->formant = (TaudFormantPatch *)calloc(1, sizeof *inst->formant);
-    if (inst->formant != NULL) te_decode_formant_block(b + FORMANT_BLOCK_START, inst->formant);
+    if (inst->formant != NULL) {
+        te_decode_formant_block(b + FORMANT_BLOCK_START, inst->formant);
+        /* The source instrument (§7.6): bits 8…9 in byte 0's two low bits,
+         * bits 0…7 in byte 1; 0 sings with the sample. */
+        inst->formant->srcInst = ((b[0] & 0x03) << 8) | b[1];
+    }
     inst->samplePtr = inst->formant != NULL ? inst->formant->srcPtr : 0;
     load_typed_record(inst, b);
 }
@@ -376,12 +408,18 @@ void te_inst_load_record(TaudInst *inst, const uint8_t *b)
         load_opl_record(inst, b);
         return;
     }
+    if (((sp >> 16) & 0xffff) == 0xffff && ((b[0] >> 4) & 0x0f) == META_TYPE_PSG) {
+        load_psg_record(inst, b);
+        return;
+    }
     if (((sp >> 16) & 0xffff) == 0xffff && ((b[0] >> 4) & 0x0f) == META_TYPE_FORMANT) {
         load_formant_record(inst, b);
         return;
     }
     free(inst->opl);
     inst->opl = NULL;
+    free(inst->psg);
+    inst->psg = NULL;
     free(inst->formant);
     inst->formant = NULL;
     if (((sp >> 16) & 0xffff) == 0xffff) {

@@ -91,9 +91,10 @@ void te_apply_active_sample(TaudVoice *v, const TaudInst *inst, const TaudPatch 
         v->activeSamplePlayStart = inst->samplePlayStart;
         v->activeSampleLoopStart = inst->sampleLoopStart;
         v->activeSampleLoopEnd = inst->sampleLoopEnd;
-        /* An OPL instrument's rate is its C2SPD; 0 plays at the tracker
-         * convention (§7.7) — the pitch has to come from somewhere. */
-        v->activeSamplingRate = inst->opl != NULL && inst->samplingRate == 0 ? OPL_C4_RATE : inst->samplingRate;
+        /* An OPL or PSG instrument's rate is its C2SPD; 0 plays at the
+         * tracker convention (§7.8, §7.9) — the pitch has to come from
+         * somewhere. */
+        v->activeSamplingRate = inst_is_chip(inst) && inst->samplingRate == 0 ? OPL_C4_RATE : inst->samplingRate;
         v->activeSampleDetune = inst_sample_detune_signed(inst);
         v->activeLoopMode = inst->loopMode;
         v->activeVibratoSpeed = inst->vibratoSpeed;
@@ -222,10 +223,12 @@ static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, int noteVal
 
 static bool fm_sounds(TaudEngine *e, const TaudMetaLayer *o, int noteVal, int seedVol)
 {
-    /* An OPL instrument is a channel, not a waveform a rack can read (§7.7);
-     * a formant instrument is a sound made of a waveform, not one (§7.8). */
-    return o->instIdx >= 1 && o->instIdx <= 1023 && !inst_is_meta(&e->instruments[o->instIdx]) &&
-        !inst_is_opl(&e->instruments[o->instIdx]) && !inst_is_formant(&e->instruments[o->instIdx]) &&
+    /* An operator is an ordinary instrument or a low meta (an OPL channel or
+     * a PSG pair, read as the chip reads its carriers — fm.c). A high meta is
+     * not: a formant instrument, a layer table or another rack is a sound
+     * made OUT of sources, and taking one would be recursion (§7.4). */
+    return o->instIdx >= 1 && o->instIdx <= 1023 &&
+        !inst_is_meta(&e->instruments[o->instIdx]) && !inst_is_high_meta(&e->instruments[o->instIdx]) &&
         noteVal >= o->pitchStart && noteVal <= o->pitchEnd &&
         seedVol >= o->volStart && seedVol <= o->volEnd;
 }
@@ -259,6 +262,15 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVa
     seedVol = gateVol >= 0 && gateVol <= 0x3f ? gateVol : 0x3f;
     if (inst_is_fm(inst)) {
         trigger_fm_rack(e, voice, vi, noteVal, inst, rowVolOverride, seedVol);
+        return;
+    }
+    /* A table of a kind this engine does not know sounds nothing (§7.4): its
+     * entries have the Layered shape, but what they mean is the kind's. */
+    if (inst->meta->type != META_TYPE_LAYERED) {
+        voice->active = false;
+        voice->layerMixGain = 1.0;
+        voice->layerRelDetune = 0;
+        voice->layerFixedNote = -1;
         return;
     }
     nLayers = te_inst_resolve_meta_layers(inst, noteVal, seedVol, layers);
@@ -405,11 +417,15 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
      * retrigger the New Note Action cuts) keeps its envelopes, as the chip
      * does — read before anything below marks the voice active. */
     bool oplCarry = voice->oplCarry && voice->active && voice->opl != NULL;
+    /* …and a PSG pair handed over the same way keeps its envelopes too. */
+    bool psgCarry = voice->psgCarry && voice->active && voice->psg != NULL;
     const TaudInst *inst;
+    const TaudInst *formantChip;
     const TaudPatch *patch;
     int seedVolForLookup;
 
     voice->oplCarry = false;
+    voice->psgCarry = false;
 
     if (instId != 0) voice->instrumentId = instId;
     inst = &e->instruments[voice->instrumentId];
@@ -418,6 +434,10 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
     else seedVolForLookup = te_narrow_vol_axis(e, voice->noteVolume);
     patch = te_inst_resolve_patch(inst, noteVal, seedVolForLookup);
     te_apply_active_sample(voice, inst, patch);
+    /* A formant instrument sung from a chip instrument (§7.6) takes the
+     * chip's C2SPD where its sample's rate would be: the pitch is the chip's. */
+    formantChip = inst->formant != NULL ? te_formant_chip_source(e, inst) : NULL;
+    if (formantChip != NULL) voice->activeSamplingRate = te_formant_chip_rate(formantChip);
     voice->tonePortaTarget = -1;
     voice->samplePos = voice->activeSamplePlayStart;
     voice->forward = true;
@@ -451,8 +471,8 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
     voice->fadeoutVolume = 1.0;
     voice->rampOutSamples = 0;
     voice->rampOutGain = 0.0;
-    /* Not on an OPL voice: its attack IS the chip's envelope. */
-    voice->attackRampSamples = inst->opl != NULL ? 0 : e->attackRampSamples;
+    /* Not on an OPL or PSG voice: its attack IS the chip's envelope. */
+    voice->attackRampSamples = inst_is_chip(inst) ? 0 : e->attackRampSamples;
     voice->autoVibPhase = 0;
     voice->autoVibTicksSinceTrigger = 0;
     voice->nesDpcmCounter = 63;
@@ -531,10 +551,20 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
     } else {
         voice->opl = NULL;
     }
+    /* The PSG pair (§7.9): keyed on here, carried or fresh, the voice's own
+     * state reused — which keeps an oscillator's internal status from note to
+     * note on the lane, unless its X flag resets it at this key-on. */
+    if (inst->psg != NULL) {
+        if (voice->psg == NULL) { voice->psg = &voice->psgStore; te_psg_state_init(voice->psg); }
+        te_psg_key_on(voice->psg, inst->psg, psgCarry);
+    } else {
+        voice->psg = NULL;
+    }
     /* A formant instrument (item 212): every trigger is a fresh syllable. */
     if (inst->formant != NULL) {
         if (voice->formant == NULL) { voice->formant = &voice->formantStore; te_formant_state_init(voice->formant); }
         te_formant_note_on(e, voice->formant, inst->formant);
+        te_formant_key_source(voice->formant, formantChip);
     } else {
         voice->formant = NULL;
     }
@@ -772,6 +802,7 @@ static TaudVoice *ghost_voice(TaudEngine *e, const TaudVoice *src, int channel)
      * copy, clock and envelopes and all. A formant ghost keeps saying the
      * syllable it was saying, into its coda once released. */
     if (src->opl != NULL) { v->oplStore = src->oplStore; v->opl = &v->oplStore; }
+    if (src->psg != NULL) { v->psgStore = src->psgStore; v->psg = &v->psgStore; }
     if (src->formant != NULL) { v->formantStore = src->formantStore; v->formant = &v->formantStore; }
     return v;
 }
@@ -820,6 +851,12 @@ void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *voice, int chan
         /* An OPL note cut by an OPL note is a retrigger of the same channel
          * (§5.5.2): no ghost, no ramp; te_trigger_note picks it up. */
         voice->oplCarry = true;
+        return;
+    }
+    if (nna == 1 && voice->psg != NULL && voice->fmRig == NULL &&
+        inst_is_psg(&e->instruments[incomingInst != 0 ? incomingInst : voice->instrumentId])) {
+        /* A PSG note cut by a PSG note re-keys the same pair, as OPL does (§5.5.4). */
+        voice->psgCarry = true;
         return;
     }
     if (nna == 1) {

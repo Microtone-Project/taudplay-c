@@ -30,6 +30,31 @@
 #define FB_GR 53
 #define FORMANT_SLOT_BYTES 12
 
+/* The reference note a record with NO vowel sizes its consonants by: C3. */
+#define FORMANT_DEFAULT_REF 0x4000
+
+/* The onset's secondary articulation (FB_GR bits 3–4) and the coda's own
+ * articulation (bits 5–6), which shares the two in the middle. */
+#define ART_NONE 0
+#define ART_PALATAL 1
+#define ART_DARK 2
+#define ART_GLOTTAL 3
+#define CODA_RELEASED 0
+#define CODA_UNRELEASED 1
+#define CODA_DARK 2
+#define CODA_GLOTTAL 3
+
+/* A glottalised consonant: the glottis shut this long past the consonant's
+ * release (or at a sonorant's start), the voicing then in this fast; a
+ * stop's voicing lags its burst by no more than GLOT_LAG; in a coda the
+ * voicing stops in GLOT_STOP. */
+#define GLOT_CATCH 10
+#define GLOT_RISE 2
+#define GLOT_LAG 10
+#define GLOT_STOP 3
+/* What a hissing nucleus takes to let its hiss go before the coda. */
+#define NUCLEUS_RELEASE 10
+
 static int fu16(const uint8_t *b, int o) { return b[o] | (b[o + 1] << 8); }
 static uint32_t fu24(const uint8_t *b, int o) { return (uint32_t)b[o] | ((uint32_t)b[o + 1] << 8) | ((uint32_t)b[o + 2] << 16); }
 
@@ -41,12 +66,15 @@ void te_decode_formant_block(const uint8_t *raw, TaudFormantPatch *patch)
     patch->open = raw[FB_OPEN];
     patch->round = raw[FB_ROUND];
     patch->track = raw[FB_TRACK];
-    patch->refNote = fu16(raw, FB_REF);
+    patch->refNote = fu16(raw, FB_REF) & 0x7fff;
+    patch->nasal = (fu16(raw, FB_REF) & 0x8000) != 0;
     patch->glide = raw[FB_GLIDE];
     patch->timing = raw[FB_TIMING];
     patch->rangeLo = fu24(raw, FB_RANGE_LO);
     patch->rangeHi = fu24(raw, FB_RANGE_HI);
     patch->semivowel = (gr & 7) <= 4 ? gr & 7 : 0;
+    patch->secondary = (gr >> 3) & 3;
+    patch->codaArt = (gr >> 5) & 3;
     patch->rhotic = (gr & 0x80) != 0;
     for (i = 0; i < FORMANT_SLOTS; i++) {
         const uint8_t *o = raw + FB_SLOTS + i * FORMANT_SLOT_BYTES;
@@ -71,9 +99,8 @@ static const int CARDINAL_VOWELS[4][4][2] = {
     { { 850, 1610 }, { 820, 1530 }, { 750, 940 }, { 700, 760 } },
 };
 
-static void vowel_f1f2(const TaudEngine *e, double front, double open, double round, double out[2])
+static void vowel_f1f2(const TaudFormantTables *T, double front, double open, double round, double out[2])
 {
-    const TaudFormantTables *T = &e->formantTables;
     double x = dmin(dmax(front / 255, 0), 1);
     double r = dmin(dmax(round / 255, 0), 1);
     double h = dmin(dmax(open / 255, 0), 1) * 3;
@@ -93,7 +120,7 @@ static void vowel_f1f2(const TaudEngine *e, double front, double open, double ro
 static double vowel_f1_at(const TaudEngine *e, double front, double open, double round)
 {
     double f[2];
-    vowel_f1f2(e, front, open, round, f);
+    vowel_f1f2(&e->formantTables, front, open, round, f);
     return f[0];
 }
 
@@ -101,10 +128,10 @@ static double vowel_f1_at(const TaudEngine *e, double front, double open, double
 #define RHOTIC_F2 1379
 #define RHOTIC_F4 3335
 
-static void vowel_formants(const TaudEngine *e, double front, double open, double round, double *F, bool rhotic)
+static void vowel_formants(const TaudFormantTables *T, double front, double open, double round, double *F, bool rhotic)
 {
     double f12[2], f1, f2, f3u, f3r, f3, f4, f5;
-    vowel_f1f2(e, front, open, round, f12);
+    vowel_f1f2(T, front, open, round, f12);
     f1 = f12[0];
     f2 = f12[1];
     f3u = dmax(2500, f2 + 700);
@@ -119,6 +146,10 @@ static void vowel_formants(const TaudEngine *e, double front, double open, doubl
     f5 = dmax(4500, f4 + 500);
     F[0] = f1; F[1] = f2; F[2] = f3; F[3] = f4; F[4] = f5;
 }
+
+/* A syllable without a vowel (reference note 0) is a syllabic consonant. */
+static bool has_vowel(const TaudFormantPatch *patch) { return patch->refNote != 0; }
+static int ref_note(const TaudFormantPatch *patch) { return patch->refNote != 0 ? patch->refNote : FORMANT_DEFAULT_REF; }
 
 static double note_hz(int note)
 {
@@ -146,7 +177,7 @@ static double vowel_at_pitch(const TaudEngine *e, double front, double open, dou
             o = (a + b) / 2;
         }
     }
-    vowel_formants(e, front, o, round, F, rhotic);
+    vowel_formants(&e->formantTables, front, o, round, F, rhotic);
     for (n = 0; n < 5; n++) F[n] *= s;
     if (tuned) F[0] = f0;
     ceil = 0.45 * e->rate;
@@ -170,93 +201,98 @@ static double vowel_at_pitch(const TaudEngine *e, double front, double open, dou
 #define MANNER_TRILL 8
 #define MANNER_GLOTTAL 9
 
+/* `dorsal`: the place follows the vowel (a velar); `bankBack`, when present,
+ * the bank before a back vowel. */
 typedef struct TaudConsonant {
     int id, manner;
     bool voiced;
     double F[3], B[3], bank[6];
     double lvl, dur, burst, vot, trans, av, fnz;
+    bool dorsal, hasBankBack;
+    double bankBack[6];
 } TaudConsonant;
 
 /* Generated from formant.js's ROWS: id, manner, voiced, F, B, bank (A2…A6,
- * AB), lvl, dur, burst, vot, trans, av, fnz. */
+ * AB), lvl, dur, burst, vot, trans, av, fnz, dorsal, bankBack. The velar
+ * stops' front bank is K_K_FRONT, their back one K_K_BACK. */
 static const TaudConsonant ROWS[] = {
-    { 1, 1, 0, { 400, 1100, 2150 }, { 300, 150, 220 }, { 0, 0, 0, 0, 0, 63 }, -12, 0, 5, 12, 40, 0, 0 }, /* p */
-    { 2, 1, 1, { 200, 1100, 2150 }, { 60, 110, 130 }, { 0, 0, 0, 0, 0, 63 }, -14, 0, 5, 0, 40, 0, 0 }, /* b */
-    { 3, 1, 0, { 400, 1600, 2600 }, { 300, 120, 250 }, { 0, 30, 45, 57, 63, 0 }, -10, 0, 10, 18, 45, 0, 0 }, /* t */
-    { 4, 1, 1, { 200, 1600, 2600 }, { 60, 100, 170 }, { 0, 47, 60, 62, 60, 0 }, -12, 0, 8, 0, 45, 0, 0 }, /* d */
-    { 5, 1, 0, { 400, 1500, 1900 }, { 300, 120, 250 }, { 0, 50, 55, 50, 45, 0 }, -10, 0, 10, 18, 45, 0, 0 }, /* ʈ */
-    { 6, 1, 1, { 200, 1500, 1900 }, { 60, 100, 170 }, { 0, 50, 55, 50, 45, 0 }, -12, 0, 8, 0, 45, 0, 0 }, /* ɖ */
-    { 7, 1, 0, { 300, 2100, 2900 }, { 250, 160, 330 }, { 0, 45, 55, 50, 40, 0 }, -10, 0, 15, 22, 50, 0, 0 }, /* c */
-    { 8, 1, 1, { 200, 2100, 2900 }, { 60, 150, 280 }, { 0, 45, 55, 50, 40, 0 }, -12, 0, 12, 0, 50, 0, 0 }, /* ɟ */
-    { 9, 1, 0, { 300, 1990, 2850 }, { 250, 160, 330 }, { 0, 53, 43, 45, 45, 0 }, -10, 0, 20, 25, 50, 0, 0 }, /* k */
-    { 10, 1, 1, { 200, 1990, 2850 }, { 60, 150, 280 }, { 0, 53, 43, 45, 45, 0 }, -12, 0, 15, 0, 50, 0, 0 }, /* g */
-    { 11, 1, 0, { 400, 1200, 2400 }, { 250, 150, 300 }, { 55, 45, 35, 30, 30, 0 }, -10, 0, 20, 25, 50, 0, 0 }, /* q */
-    { 12, 1, 1, { 250, 1200, 2400 }, { 60, 120, 250 }, { 55, 45, 35, 30, 30, 0 }, -12, 0, 15, 0, 50, 0, 0 }, /* ɢ */
-    { 13, 9, 0, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0, 0, 0, 0 }, 0, 0, 0, 0, 0, 0, 0 }, /* ʔ */
-    { 14, 1, 0, { 400, 1100, 2150 }, { 300, 150, 220 }, { 0, 0, 0, 0, 0, 63 }, -12, 0, 5, 58, 40, 0, 0 }, /* pʰ */
-    { 15, 1, 0, { 400, 1600, 2600 }, { 300, 120, 250 }, { 0, 30, 45, 57, 63, 0 }, -10, 0, 10, 70, 45, 0, 0 }, /* tʰ */
-    { 16, 1, 0, { 300, 1990, 2850 }, { 250, 160, 330 }, { 0, 53, 43, 45, 45, 0 }, -10, 0, 20, 80, 50, 0, 0 }, /* kʰ */
-    { 32, 5, 1, { 480, 1270, 2130 }, { 40, 200, 200 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 35, 0.5, 450 }, /* m */
-    { 33, 5, 1, { 480, 1200, 2100 }, { 40, 200, 200 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 35, 0.5, 450 }, /* ɱ */
-    { 34, 5, 1, { 480, 1340, 2470 }, { 40, 300, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 35, 0.5, 450 }, /* n */
-    { 35, 5, 1, { 480, 1400, 1900 }, { 40, 300, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 35, 0.5, 450 }, /* ɳ */
-    { 36, 5, 1, { 480, 2000, 2900 }, { 40, 300, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 40, 0.5, 450 }, /* ɲ */
-    { 37, 5, 1, { 480, 1900, 2700 }, { 40, 300, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 40, 0.5, 450 }, /* ŋ */
-    { 38, 5, 1, { 480, 1200, 2400 }, { 40, 300, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 40, 0.5, 450 }, /* ɴ */
-    { 40, 8, 1, { 300, 1100, 2150 }, { 70, 110, 130 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 50, 0, 0 }, /* ʙ */
-    { 41, 8, 1, { 300, 1500, 2500 }, { 70, 100, 150 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 50, 0, 0 }, /* r */
-    { 42, 8, 1, { 400, 1200, 2300 }, { 80, 120, 200 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 50, 0, 0 }, /* ʀ */
-    { 44, 7, 1, { 300, 1100, 2080 }, { 60, 90, 120 }, { 0, 0, 0, 0, 0, 0 }, 0, 20, 0, 0, 35, 0, 0 }, /* ⱱ */
-    { 45, 7, 1, { 300, 1600, 2600 }, { 60, 100, 170 }, { 0, 0, 0, 0, 0, 0 }, 0, 20, 0, 0, 35, 0, 0 }, /* ɾ */
-    { 46, 7, 1, { 300, 1500, 1900 }, { 60, 100, 170 }, { 0, 0, 0, 0, 0, 0 }, 0, 20, 0, 0, 35, 0, 0 }, /* ɽ */
-    { 48, 3, 0, { 340, 1000, 2100 }, { 200, 120, 150 }, { 0, 0, 0, 0, 0, 55 }, -24, 100, 0, 0, 40, 0, 0 }, /* ɸ */
-    { 49, 3, 1, { 220, 1000, 2100 }, { 60, 90, 120 }, { 0, 0, 0, 0, 0, 55 }, -28, 70, 0, 0, 40, 0.35, 0 }, /* β */
-    { 50, 3, 0, { 340, 1100, 2080 }, { 200, 120, 150 }, { 0, 0, 0, 0, 0, 57 }, -22, 100, 0, 0, 40, 0, 0 }, /* f */
-    { 51, 3, 1, { 220, 1100, 2080 }, { 60, 90, 120 }, { 0, 0, 0, 0, 0, 57 }, -26, 70, 0, 0, 40, 0.35, 0 }, /* v */
-    { 52, 3, 0, { 320, 1290, 2540 }, { 200, 90, 200 }, { 0, 0, 0, 0, 28, 48 }, -24, 100, 0, 0, 40, 0, 0 }, /* θ */
-    { 53, 3, 1, { 270, 1290, 2540 }, { 60, 80, 170 }, { 0, 0, 0, 0, 28, 48 }, -28, 70, 0, 0, 40, 0.35, 0 }, /* ð */
-    { 54, 3, 0, { 320, 1390, 2530 }, { 200, 80, 200 }, { 0, 0, 0, 0, 52, 0 }, -8, 120, 0, 0, 40, 0, 0 }, /* s */
-    { 55, 3, 1, { 240, 1390, 2530 }, { 70, 60, 180 }, { 0, 0, 0, 0, 52, 0 }, -12, 90, 0, 0, 40, 0.35, 0 }, /* z */
-    { 56, 3, 0, { 300, 1840, 2750 }, { 200, 100, 300 }, { 0, 57, 48, 48, 46, 0 }, -6, 120, 0, 0, 40, 0, 0 }, /* ʃ */
-    { 57, 3, 1, { 240, 1840, 2750 }, { 60, 100, 300 }, { 0, 57, 48, 48, 46, 0 }, -10, 90, 0, 0, 40, 0.35, 0 }, /* ʒ */
-    { 58, 3, 0, { 300, 1600, 2000 }, { 200, 100, 250 }, { 0, 57, 50, 40, 30, 0 }, -7, 120, 0, 0, 40, 0, 0 }, /* ʂ */
-    { 59, 3, 1, { 240, 1600, 2000 }, { 60, 100, 250 }, { 0, 57, 50, 40, 30, 0 }, -11, 90, 0, 0, 40, 0.35, 0 }, /* ʐ */
-    { 60, 3, 0, { 300, 2100, 3000 }, { 200, 150, 300 }, { 0, 35, 55, 50, 40, 0 }, -12, 110, 0, 0, 45, 0, 0 }, /* ç */
-    { 61, 3, 1, { 240, 2100, 3000 }, { 60, 150, 300 }, { 0, 35, 55, 50, 40, 0 }, -16, 80, 0, 0, 45, 0.35, 0 }, /* ʝ */
-    { 62, 3, 0, { 300, 1700, 2600 }, { 200, 150, 300 }, { 57, 50, 40, 35, 30, 0 }, -14, 110, 0, 0, 45, 0, 0 }, /* x */
-    { 63, 3, 1, { 240, 1700, 2600 }, { 60, 150, 300 }, { 57, 50, 40, 35, 30, 0 }, -18, 80, 0, 0, 45, 0.35, 0 }, /* ɣ */
-    { 64, 3, 0, { 400, 1200, 2400 }, { 200, 150, 300 }, { 58, 45, 35, 30, 25, 0 }, -13, 110, 0, 0, 45, 0, 0 }, /* χ */
-    { 65, 3, 1, { 300, 1200, 2400 }, { 80, 150, 300 }, { 58, 45, 35, 30, 25, 0 }, -17, 80, 0, 0, 45, 0.35, 0 }, /* ʁ */
-    { 66, 4, 0, { 700, 1100, 2500 }, { 300, 150, 300 }, { 0, 0, 0, 0, 0, 0 }, -16, 90, 0, 0, 30, 0, 0 }, /* ħ */
-    { 67, 4, 1, { 700, 1100, 2500 }, { 100, 150, 300 }, { 0, 0, 0, 0, 0, 0 }, -20, 70, 0, 0, 30, 0.4, 0 }, /* ʕ */
-    { 68, 4, 0, { 0, 0, 0 }, { 300, 0, 0 }, { 0, 0, 0, 0, 0, 0 }, -16, 70, 0, 0, 15, 0, 0 }, /* h */
-    { 69, 4, 1, { 0, 0, 0 }, { 300, 0, 0 }, { 0, 0, 0, 0, 0, 0 }, -20, 60, 0, 0, 15, 0.4, 0 }, /* ɦ */
-    { 70, 3, 0, { 320, 1300, 2600 }, { 200, 90, 200 }, { 0, 0, 45, 50, 48, 40 }, -12, 110, 0, 0, 45, 0, 0 }, /* ɬ */
-    { 71, 3, 1, { 240, 1300, 2600 }, { 60, 90, 200 }, { 0, 0, 45, 50, 48, 40 }, -16, 80, 0, 0, 45, 0.35, 0 }, /* ɮ */
-    { 72, 3, 0, { 300, 2000, 2900 }, { 200, 120, 300 }, { 0, 45, 57, 50, 45, 0 }, -7, 120, 0, 0, 45, 0, 0 }, /* ɕ */
-    { 73, 3, 1, { 240, 2000, 2900 }, { 60, 120, 300 }, { 0, 45, 57, 50, 45, 0 }, -11, 90, 0, 0, 45, 0.35, 0 }, /* ʑ */
-    { 74, 3, 0, { 290, 610, 2150 }, { 200, 80, 60 }, { 0, 0, 0, 0, 0, 50 }, -22, 90, 0, 0, 100, 0, 0 }, /* ʍ */
-    { 80, 6, 1, { 300, 1100, 2200 }, { 60, 90, 150 }, { 0, 0, 0, 0, 0, 0 }, 0, 50, 0, 0, 70, 0.4, 0 }, /* ʋ */
-    { 81, 6, 1, { 310, 1060, 1380 }, { 70, 100, 120 }, { 0, 0, 0, 0, 0, 0 }, 0, 50, 0, 0, 90, 0.4, 0 }, /* ɹ */
-    { 82, 6, 1, { 310, 1100, 1500 }, { 70, 100, 120 }, { 0, 0, 0, 0, 0, 0 }, 0, 50, 0, 0, 90, 0.4, 0 }, /* ɻ */
-    { 83, 6, 1, { 260, 2070, 3020 }, { 40, 250, 500 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 100, 0.4, 0 }, /* j */
-    { 84, 6, 1, { 300, 1200, 2400 }, { 50, 90, 150 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 100, 0.4, 0 }, /* ɰ */
-    { 85, 6, 1, { 290, 610, 2150 }, { 50, 80, 60 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 100, 0.4, 0 }, /* w */
-    { 86, 6, 1, { 260, 1700, 2200 }, { 40, 200, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 100, 0.4, 0 }, /* ɥ */
-    { 88, 6, 1, { 310, 1050, 2880 }, { 50, 100, 280 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 60, 0.4, 0 }, /* l */
-    { 89, 6, 1, { 310, 1300, 1900 }, { 50, 100, 200 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 60, 0.4, 0 }, /* ɭ */
-    { 90, 6, 1, { 300, 2000, 2800 }, { 50, 150, 250 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 70, 0.4, 0 }, /* ʎ */
-    { 91, 6, 1, { 310, 1100, 2700 }, { 50, 100, 250 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 70, 0.4, 0 }, /* ʟ */
-    { 96, 2, 0, { 320, 1500, 2550 }, { 200, 90, 200 }, { 0, 0, 0, 0, 52, 0 }, -8, 70, 8, 0, 40, 0, 0 }, /* t͡s */
-    { 97, 2, 1, { 240, 1500, 2550 }, { 70, 60, 180 }, { 0, 0, 0, 0, 52, 0 }, -12, 60, 8, 0, 40, 0, 0 }, /* d͡z */
-    { 98, 2, 0, { 350, 1800, 2820 }, { 200, 90, 300 }, { 0, 44, 60, 53, 53, 0 }, -6, 70, 8, 0, 40, 0, 0 }, /* t͡ʃ */
-    { 99, 2, 1, { 260, 1800, 2820 }, { 60, 80, 270 }, { 0, 44, 60, 53, 53, 0 }, -10, 60, 8, 0, 40, 0, 0 }, /* d͡ʒ */
-    { 100, 2, 0, { 300, 2000, 2900 }, { 200, 120, 300 }, { 0, 45, 57, 50, 45, 0 }, -7, 70, 10, 0, 45, 0, 0 }, /* t͡ɕ */
-    { 101, 2, 1, { 240, 2000, 2900 }, { 60, 120, 300 }, { 0, 45, 57, 50, 45, 0 }, -11, 60, 10, 0, 45, 0, 0 }, /* d͡ʑ */
-    { 102, 2, 0, { 300, 1600, 2000 }, { 200, 100, 250 }, { 0, 57, 50, 40, 30, 0 }, -7, 70, 10, 0, 45, 0, 0 }, /* ʈ͡ʂ */
-    { 103, 2, 1, { 240, 1600, 2000 }, { 60, 100, 250 }, { 0, 57, 50, 40, 30, 0 }, -11, 60, 10, 0, 45, 0, 0 }, /* ɖ͡ʐ */
-    { 104, 2, 0, { 340, 1100, 2080 }, { 200, 120, 150 }, { 0, 0, 0, 0, 0, 57 }, -16, 70, 5, 0, 40, 0, 0 }, /* p͡f */
-    { 105, 2, 0, { 300, 1800, 2700 }, { 250, 160, 330 }, { 57, 50, 40, 35, 30, 0 }, -12, 70, 20, 0, 50, 0, 0 }, /* k͡x */
+    { 1, 1, 0, { 400, 1100, 2150 }, { 300, 150, 220 }, { 0, 0, 0, 0, 0, 63 }, -12, 0, 5, 12, 40, 0, 0, 0, 0, { 0 } }, /* p */
+    { 2, 1, 1, { 200, 1100, 2150 }, { 60, 110, 130 }, { 0, 0, 0, 0, 0, 63 }, -14, 0, 5, 0, 40, 0, 0, 0, 0, { 0 } }, /* b */
+    { 3, 1, 0, { 400, 1600, 2600 }, { 300, 120, 250 }, { 0, 30, 45, 57, 63, 0 }, -10, 0, 10, 18, 45, 0, 0, 0, 0, { 0 } }, /* t */
+    { 4, 1, 1, { 200, 1600, 2600 }, { 60, 100, 170 }, { 0, 47, 60, 62, 60, 0 }, -12, 0, 8, 0, 45, 0, 0, 0, 0, { 0 } }, /* d */
+    { 5, 1, 0, { 400, 1500, 1900 }, { 300, 120, 250 }, { 0, 50, 55, 50, 45, 0 }, -10, 0, 10, 18, 45, 0, 0, 0, 0, { 0 } }, /* ʈ */
+    { 6, 1, 1, { 200, 1500, 1900 }, { 60, 100, 170 }, { 0, 50, 55, 50, 45, 0 }, -12, 0, 8, 0, 45, 0, 0, 0, 0, { 0 } }, /* ɖ */
+    { 7, 1, 0, { 300, 2100, 2900 }, { 250, 160, 330 }, { 0, 45, 55, 50, 40, 0 }, -10, 0, 15, 22, 50, 0, 0, 0, 0, { 0 } }, /* c */
+    { 8, 1, 1, { 200, 2100, 2900 }, { 60, 150, 280 }, { 0, 45, 55, 50, 40, 0 }, -12, 0, 12, 0, 50, 0, 0, 0, 0, { 0 } }, /* ɟ */
+    { 9, 1, 0, { 300, 1990, 2850 }, { 250, 160, 330 }, { 0, 60, 43, 45, 45, 0 }, -10, 0, 20, 25, 50, 0, 0, 1, 1, { 60, 53, 43, 45, 45, 0 } }, /* k */
+    { 10, 1, 1, { 200, 1990, 2850 }, { 60, 150, 280 }, { 0, 60, 43, 45, 45, 0 }, -12, 0, 15, 0, 50, 0, 0, 1, 1, { 60, 53, 43, 45, 45, 0 } }, /* ɡ */
+    { 11, 1, 0, { 400, 1200, 2400 }, { 250, 150, 300 }, { 55, 45, 35, 30, 30, 0 }, -10, 0, 20, 25, 50, 0, 0, 0, 0, { 0 } }, /* q */
+    { 12, 1, 1, { 250, 1200, 2400 }, { 60, 120, 250 }, { 55, 45, 35, 30, 30, 0 }, -12, 0, 15, 0, 50, 0, 0, 0, 0, { 0 } }, /* ɢ */
+    { 13, 9, 0, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0, 0, 0, 0 }, 0, 0, 0, 0, 0, 0, 0, 0, 0, { 0 } }, /* ʔ */
+    { 14, 1, 0, { 400, 1100, 2150 }, { 300, 150, 220 }, { 0, 0, 0, 0, 0, 63 }, -12, 0, 5, 58, 40, 0, 0, 0, 0, { 0 } }, /* pʰ */
+    { 15, 1, 0, { 400, 1600, 2600 }, { 300, 120, 250 }, { 0, 30, 45, 57, 63, 0 }, -10, 0, 10, 70, 45, 0, 0, 0, 0, { 0 } }, /* tʰ */
+    { 16, 1, 0, { 300, 1990, 2850 }, { 250, 160, 330 }, { 0, 60, 43, 45, 45, 0 }, -10, 0, 20, 80, 50, 0, 0, 1, 1, { 60, 53, 43, 45, 45, 0 } }, /* kʰ */
+    { 32, 5, 1, { 480, 1270, 2130 }, { 40, 200, 200 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 35, 0.5, 450, 0, 0, { 0 } }, /* m */
+    { 33, 5, 1, { 480, 1200, 2100 }, { 40, 200, 200 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 35, 0.5, 450, 0, 0, { 0 } }, /* ɱ */
+    { 34, 5, 1, { 480, 1340, 2470 }, { 40, 300, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 35, 0.5, 450, 0, 0, { 0 } }, /* n */
+    { 35, 5, 1, { 480, 1400, 1900 }, { 40, 300, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 35, 0.5, 450, 0, 0, { 0 } }, /* ɳ */
+    { 36, 5, 1, { 480, 2000, 2900 }, { 40, 300, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 40, 0.5, 450, 0, 0, { 0 } }, /* ɲ */
+    { 37, 5, 1, { 480, 1900, 2700 }, { 40, 300, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 40, 0.5, 450, 1, 0, { 0 } }, /* ŋ */
+    { 38, 5, 1, { 480, 1200, 2400 }, { 40, 300, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 40, 0.5, 450, 0, 0, { 0 } }, /* ɴ */
+    { 40, 8, 1, { 300, 1100, 2150 }, { 70, 110, 130 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 50, 0, 0, 0, 0, { 0 } }, /* ʙ */
+    { 41, 8, 1, { 300, 1500, 2500 }, { 70, 100, 150 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 50, 0, 0, 0, 0, { 0 } }, /* r */
+    { 42, 8, 1, { 400, 1200, 2300 }, { 80, 120, 200 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 50, 0, 0, 0, 0, { 0 } }, /* ʀ */
+    { 44, 7, 1, { 300, 1100, 2080 }, { 60, 90, 120 }, { 0, 0, 0, 0, 0, 0 }, 0, 20, 0, 0, 35, 0, 0, 0, 0, { 0 } }, /* ⱱ */
+    { 45, 7, 1, { 300, 1600, 2600 }, { 60, 100, 170 }, { 0, 0, 0, 0, 0, 0 }, 0, 20, 0, 0, 35, 0, 0, 0, 0, { 0 } }, /* ɾ */
+    { 46, 7, 1, { 300, 1500, 1900 }, { 60, 100, 170 }, { 0, 0, 0, 0, 0, 0 }, 0, 20, 0, 0, 35, 0, 0, 0, 0, { 0 } }, /* ɽ */
+    { 48, 3, 0, { 340, 1000, 2100 }, { 200, 120, 150 }, { 0, 0, 0, 0, 0, 55 }, -24, 100, 0, 0, 40, 0, 0, 0, 0, { 0 } }, /* ɸ */
+    { 49, 3, 1, { 220, 1000, 2100 }, { 60, 90, 120 }, { 0, 0, 0, 0, 0, 55 }, -28, 70, 0, 0, 40, 0.35, 0, 0, 0, { 0 } }, /* β */
+    { 50, 3, 0, { 340, 1100, 2080 }, { 200, 120, 150 }, { 0, 0, 0, 0, 0, 57 }, -22, 100, 0, 0, 40, 0, 0, 0, 0, { 0 } }, /* f */
+    { 51, 3, 1, { 220, 1100, 2080 }, { 60, 90, 120 }, { 0, 0, 0, 0, 0, 57 }, -26, 70, 0, 0, 40, 0.35, 0, 0, 0, { 0 } }, /* v */
+    { 52, 3, 0, { 320, 1290, 2540 }, { 200, 90, 200 }, { 0, 0, 0, 0, 28, 48 }, -24, 100, 0, 0, 40, 0, 0, 0, 0, { 0 } }, /* θ */
+    { 53, 3, 1, { 270, 1290, 2540 }, { 60, 80, 170 }, { 0, 0, 0, 0, 28, 48 }, -28, 70, 0, 0, 40, 0.35, 0, 0, 0, { 0 } }, /* ð */
+    { 54, 3, 0, { 320, 1390, 2530 }, { 200, 80, 200 }, { 0, 0, 0, 0, 52, 0 }, -8, 120, 0, 0, 40, 0, 0, 0, 0, { 0 } }, /* s */
+    { 55, 3, 1, { 240, 1390, 2530 }, { 70, 60, 180 }, { 0, 0, 0, 0, 52, 0 }, -12, 90, 0, 0, 40, 0.35, 0, 0, 0, { 0 } }, /* z */
+    { 56, 3, 0, { 300, 1840, 2750 }, { 200, 100, 300 }, { 0, 57, 48, 48, 46, 0 }, -6, 120, 0, 0, 40, 0, 0, 0, 0, { 0 } }, /* ʃ */
+    { 57, 3, 1, { 240, 1840, 2750 }, { 60, 100, 300 }, { 0, 57, 48, 48, 46, 0 }, -10, 90, 0, 0, 40, 0.35, 0, 0, 0, { 0 } }, /* ʒ */
+    { 58, 3, 0, { 300, 1600, 2000 }, { 200, 100, 250 }, { 0, 57, 50, 40, 30, 0 }, -7, 120, 0, 0, 40, 0, 0, 0, 0, { 0 } }, /* ʂ */
+    { 59, 3, 1, { 240, 1600, 2000 }, { 60, 100, 250 }, { 0, 57, 50, 40, 30, 0 }, -11, 90, 0, 0, 40, 0.35, 0, 0, 0, { 0 } }, /* ʐ */
+    { 60, 3, 0, { 300, 2100, 3000 }, { 200, 150, 300 }, { 0, 35, 55, 50, 40, 0 }, -12, 110, 0, 0, 45, 0, 0, 0, 0, { 0 } }, /* ç */
+    { 61, 3, 1, { 240, 2100, 3000 }, { 60, 150, 300 }, { 0, 35, 55, 50, 40, 0 }, -16, 80, 0, 0, 45, 0.35, 0, 0, 0, { 0 } }, /* ʝ */
+    { 62, 3, 0, { 300, 1700, 2600 }, { 200, 150, 300 }, { 57, 50, 40, 35, 30, 0 }, -14, 110, 0, 0, 45, 0, 0, 1, 0, { 0 } }, /* x */
+    { 63, 3, 1, { 240, 1700, 2600 }, { 60, 150, 300 }, { 57, 50, 40, 35, 30, 0 }, -18, 80, 0, 0, 45, 0.35, 0, 1, 0, { 0 } }, /* ɣ */
+    { 64, 3, 0, { 400, 1200, 2400 }, { 200, 150, 300 }, { 58, 45, 35, 30, 25, 0 }, -13, 110, 0, 0, 45, 0, 0, 0, 0, { 0 } }, /* χ */
+    { 65, 3, 1, { 300, 1200, 2400 }, { 80, 150, 300 }, { 58, 45, 35, 30, 25, 0 }, -17, 80, 0, 0, 45, 0.35, 0, 0, 0, { 0 } }, /* ʁ */
+    { 66, 4, 0, { 700, 1100, 2500 }, { 300, 150, 300 }, { 0, 0, 0, 0, 0, 0 }, -16, 90, 0, 0, 30, 0, 0, 0, 0, { 0 } }, /* ħ */
+    { 67, 4, 1, { 700, 1100, 2500 }, { 100, 150, 300 }, { 0, 0, 0, 0, 0, 0 }, -20, 70, 0, 0, 30, 0.4, 0, 0, 0, { 0 } }, /* ʕ */
+    { 68, 4, 0, { 0, 0, 0 }, { 300, 0, 0 }, { 0, 0, 0, 0, 0, 0 }, -16, 70, 0, 0, 15, 0, 0, 0, 0, { 0 } }, /* h */
+    { 69, 4, 1, { 0, 0, 0 }, { 300, 0, 0 }, { 0, 0, 0, 0, 0, 0 }, -20, 60, 0, 0, 15, 0.4, 0, 0, 0, { 0 } }, /* ɦ */
+    { 70, 3, 0, { 320, 1300, 2600 }, { 200, 90, 200 }, { 0, 0, 45, 50, 48, 40 }, -12, 110, 0, 0, 45, 0, 0, 0, 0, { 0 } }, /* ɬ */
+    { 71, 3, 1, { 240, 1300, 2600 }, { 60, 90, 200 }, { 0, 0, 45, 50, 48, 40 }, -16, 80, 0, 0, 45, 0.35, 0, 0, 0, { 0 } }, /* ɮ */
+    { 72, 3, 0, { 300, 2000, 2900 }, { 200, 120, 300 }, { 0, 45, 57, 50, 45, 0 }, -7, 120, 0, 0, 45, 0, 0, 0, 0, { 0 } }, /* ɕ */
+    { 73, 3, 1, { 240, 2000, 2900 }, { 60, 120, 300 }, { 0, 45, 57, 50, 45, 0 }, -11, 90, 0, 0, 45, 0.35, 0, 0, 0, { 0 } }, /* ʑ */
+    { 74, 3, 0, { 290, 610, 2150 }, { 200, 80, 60 }, { 0, 0, 0, 0, 0, 50 }, -22, 90, 0, 0, 100, 0, 0, 0, 0, { 0 } }, /* ʍ */
+    { 80, 6, 1, { 300, 1100, 2200 }, { 60, 90, 150 }, { 0, 0, 0, 0, 0, 0 }, 0, 50, 0, 0, 70, 0.4, 0, 0, 0, { 0 } }, /* ʋ */
+    { 81, 6, 1, { 310, 1060, 1380 }, { 70, 100, 120 }, { 0, 0, 0, 0, 0, 0 }, 0, 50, 0, 0, 90, 0.4, 0, 0, 0, { 0 } }, /* ɹ */
+    { 82, 6, 1, { 310, 1100, 1500 }, { 70, 100, 120 }, { 0, 0, 0, 0, 0, 0 }, 0, 50, 0, 0, 90, 0.4, 0, 0, 0, { 0 } }, /* ɻ */
+    { 83, 6, 1, { 260, 2070, 3020 }, { 40, 250, 500 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 100, 0.4, 0, 0, 0, { 0 } }, /* j */
+    { 84, 6, 1, { 300, 1200, 2400 }, { 50, 90, 150 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 100, 0.4, 0, 0, 0, { 0 } }, /* ɰ */
+    { 85, 6, 1, { 290, 610, 2150 }, { 50, 80, 60 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 100, 0.4, 0, 0, 0, { 0 } }, /* w */
+    { 86, 6, 1, { 260, 1700, 2200 }, { 40, 200, 300 }, { 0, 0, 0, 0, 0, 0 }, 0, 40, 0, 0, 100, 0.4, 0, 0, 0, { 0 } }, /* ɥ */
+    { 88, 6, 1, { 310, 1050, 2880 }, { 50, 100, 280 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 60, 0.4, 0, 0, 0, { 0 } }, /* l */
+    { 89, 6, 1, { 310, 1300, 1900 }, { 50, 100, 200 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 60, 0.4, 0, 0, 0, { 0 } }, /* ɭ */
+    { 90, 6, 1, { 300, 2000, 2800 }, { 50, 150, 250 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 70, 0.4, 0, 0, 0, { 0 } }, /* ʎ */
+    { 91, 6, 1, { 310, 1100, 2700 }, { 50, 100, 250 }, { 0, 0, 0, 0, 0, 0 }, 0, 60, 0, 0, 70, 0.4, 0, 0, 0, { 0 } }, /* ʟ */
+    { 96, 2, 0, { 320, 1500, 2550 }, { 200, 90, 200 }, { 0, 0, 0, 0, 52, 0 }, -8, 70, 8, 0, 40, 0, 0, 0, 0, { 0 } }, /* t͡s */
+    { 97, 2, 1, { 240, 1500, 2550 }, { 70, 60, 180 }, { 0, 0, 0, 0, 52, 0 }, -12, 60, 8, 0, 40, 0, 0, 0, 0, { 0 } }, /* d͡z */
+    { 98, 2, 0, { 350, 1800, 2820 }, { 200, 90, 300 }, { 0, 44, 60, 53, 53, 0 }, -6, 70, 8, 0, 40, 0, 0, 0, 0, { 0 } }, /* t͡ʃ */
+    { 99, 2, 1, { 260, 1800, 2820 }, { 60, 80, 270 }, { 0, 44, 60, 53, 53, 0 }, -10, 60, 8, 0, 40, 0, 0, 0, 0, { 0 } }, /* d͡ʒ */
+    { 100, 2, 0, { 300, 2000, 2900 }, { 200, 120, 300 }, { 0, 45, 57, 50, 45, 0 }, -7, 70, 10, 0, 45, 0, 0, 0, 0, { 0 } }, /* t͡ɕ */
+    { 101, 2, 1, { 240, 2000, 2900 }, { 60, 120, 300 }, { 0, 45, 57, 50, 45, 0 }, -11, 60, 10, 0, 45, 0, 0, 0, 0, { 0 } }, /* d͡ʑ */
+    { 102, 2, 0, { 300, 1600, 2000 }, { 200, 100, 250 }, { 0, 57, 50, 40, 30, 0 }, -7, 70, 10, 0, 45, 0, 0, 0, 0, { 0 } }, /* ʈ͡ʂ */
+    { 103, 2, 1, { 240, 1600, 2000 }, { 60, 100, 250 }, { 0, 57, 50, 40, 30, 0 }, -11, 60, 10, 0, 45, 0, 0, 0, 0, { 0 } }, /* ɖ͡ʐ */
+    { 104, 2, 0, { 340, 1100, 2080 }, { 200, 120, 150 }, { 0, 0, 0, 0, 0, 57 }, -16, 70, 5, 0, 40, 0, 0, 0, 0, { 0 } }, /* p͡f */
+    { 105, 2, 0, { 300, 1800, 2700 }, { 250, 160, 330 }, { 57, 50, 40, 35, 30, 0 }, -12, 70, 20, 0, 50, 0, 0, 1, 0, { 0 } }, /* k͡x */
 };
 #define ROW_COUNT ((int)(sizeof ROWS / sizeof ROWS[0]))
 
@@ -322,31 +358,69 @@ static double track_at(const TaudFormantTrack *tr, double t)
 
 typedef struct { double av, ah, af, nz; } NextStart;
 
-/* An onset consonant's tracks (onsetTracks). */
-static void onset_tracks(const TaudConsonant *r, bool first, const NextStart *nx, double k, TaudFormantSegment *sg)
+/* Append a point as Float64Array.from does, without at()'s clamp. */
+static void tr_push(TaudFormantTrack *t, double time, double v)
+{
+    if (t->n + 2 <= FORMANT_TRACK_MAX) { t->p[t->n] = time; t->p[t->n + 1] = v; t->n += 2; }
+}
+
+/* A closed track with a glottal catch at its START (catchTrack): 0 until t0,
+ * back on the track's own value by t1. */
+static void catch_track(TaudFormantTrack *tr, double t0, double t1)
+{
+    TaudFormantTrack out;
+    int i;
+    out.n = 0;
+    tr_push(&out, 0, 0);
+    tr_push(&out, t0, 0);
+    tr_push(&out, t1, track_at(tr, t1));
+    for (i = 0; i < tr->n; i += 2) if (tr->p[i] > t1) tr_push(&out, tr->p[i], tr->p[i + 1]);
+    *tr = out;
+}
+
+/* The av track's glottal catch for an obstruent's voicing (onsetTracks catchAt). */
+static void catch_at(TaudFormantTrack *av, double t, double k, double nxAv)
+{
+    tr_at(tr_at(tr_at(av, 0, 0), t + GLOT_CATCH * k, 0), t + (GLOT_CATCH + GLOT_RISE) * k, nxAv);
+}
+
+/* An onset consonant's tracks (onsetTracks). `art` is its secondary
+ * articulation, of which only the glottal one changes a track. Every oral
+ * consonant's nasality holds 0 until its own part is over. */
+static void onset_tracks(const TaudConsonant *r, bool first, const NextStart *nx, double k, int art,
+                         TaudFormantSegment *sg)
 {
     TaudFormantTrack *w = &sg->w, *av = &sg->av, *ah = &sg->ah, *af = &sg->af, *nz = &sg->nz;
     double L = db_gain(r->lvl);
     double tr = r->trans * k, dur = r->dur * k, end;
+    bool glot = art == ART_GLOTTAL, sonorant = false;
     tr_reset(w); tr_reset(av); tr_reset(ah); tr_reset(af); tr_reset(nz);
     switch (r->manner) {
     case MANNER_STOP: {
         double cl = first ? 0 : CLOSURE_MS * k;
         double tb = cl + r->burst * k;
-        double tv = tb + r->vot * k;
+        double tv;
+        tr_at(tr_at(tr_at(tr_at(tr_at(af, 0, 0), cl, 0), cl, L), tb, 0.3 * L), tb + 2 * k, 0);
+        tr_at(ah, 0, 0);
+        tr_at(tr_at(tr_at(tr_at(w, 0, 1), tb, 1), tb + 1 * k, 0.5), tb + tr, 0);
+        tr_at(tr_at(nz, 0, 0), tb, 0);
+        if (glot) {
+            /* The glottis shut through the closure, the voicing in at once. */
+            tv = tb + dmin(r->vot, GLOT_LAG) * k;
+            tr_at(tr_at(tr_at(av, 0, 0), tv, 0), tv + GLOT_RISE * k, nx->av);
+            end = dmax(tv + GLOT_RISE * k, tb + tr);
+            break;
+        }
+        tv = tb + r->vot * k;
         if (r->voiced) {
             tr_at(tr_at(tr_at(tr_at(av, 0, cl > 0 ? 0.25 : 0.3), cl, cl > 0 ? 0.25 : 0.3), tb, 0.3), tb + 10 * k, nx->av);
         } else {
             tr_at(tr_at(tr_at(av, 0, 0), tv, 0), tv + 10 * k, nx->av);
         }
-        tr_at(tr_at(tr_at(tr_at(tr_at(af, 0, 0), cl, 0), cl, L), tb, 0.3 * L), tb + 2 * k, 0);
-        tr_at(ah, 0, 0);
         if (!r->voiced && r->vot > 0) {
             double La = L * db_gain(ASPIRATION_DB);
             tr_at(tr_at(tr_at(tr_at(ah, tb, 0), tb + 3 * k, La), tv, 0.7 * La), tv + 10 * k, nx->ah);
         }
-        tr_at(tr_at(tr_at(tr_at(w, 0, 1), tb, 1), tb + 1 * k, 0.5), tb + tr, 0);
-        tr_at(nz, 0, 0);
         end = dmax(tv + 10 * k, tb + tr);
         break;
     }
@@ -355,31 +429,37 @@ static void onset_tracks(const TaudConsonant *r, bool first, const NextStart *nx
         double tb = cl + r->burst * k;
         double tf = tb + dur;
         tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(af, 0, 0), cl, 0), cl, L), tb, 0.8 * L), tf - 10 * k, L), tf + 10 * k, nx->af);
-        if (r->voiced) tr_at(tr_at(tr_at(av, 0, 0.3), tf, 0.3), tf + 15 * k, nx->av);
+        if (glot) catch_at(av, tf, k, nx->av);
+        else if (r->voiced) tr_at(tr_at(tr_at(av, 0, 0.3), tf, 0.3), tf + 15 * k, nx->av);
         else tr_at(tr_at(tr_at(av, 0, 0), tf, 0), tf + 15 * k, nx->av);
         tr_at(ah, 0, 0);
         tr_at(tr_at(tr_at(w, 0, 1), tf, 1), tf + tr, 0);
-        tr_at(nz, 0, 0);
+        tr_at(tr_at(nz, 0, 0), tf, 0);
         end = dmax(tf + 15 * k, tf + tr);
+        if (glot) end = dmax(end, tf + (GLOT_CATCH + GLOT_RISE) * k);
         break;
     }
     case MANNER_FRICATIVE:
         tr_at(tr_at(tr_at(tr_at(af, 0, 0), 10 * k, L), dur - 10 * k, L), dur + 10 * k, nx->af);
-        if (r->voiced) tr_at(tr_at(tr_at(av, 0, r->av), dur, r->av), dur + 15 * k, nx->av);
+        if (glot) catch_at(av, dur, k, nx->av);
+        else if (r->voiced) tr_at(tr_at(tr_at(av, 0, r->av), dur, r->av), dur + 15 * k, nx->av);
         else tr_at(tr_at(tr_at(av, 0, 0), dur - 5 * k, 0), dur + 15 * k, nx->av);
         tr_at(ah, 0, 0);
         tr_at(tr_at(tr_at(w, 0, 1), dur, 1), dur + tr, 0);
-        tr_at(nz, 0, 0);
+        tr_at(tr_at(nz, 0, 0), dur, 0);
         end = dmax(dur + 15 * k, dur + tr);
+        if (glot) end = dmax(end, dur + (GLOT_CATCH + GLOT_RISE) * k);
         break;
     case MANNER_ASPIRATE:
         tr_at(tr_at(tr_at(tr_at(ah, 0, 0), 10 * k, L), dur - 10 * k, L), dur + 10 * k, nx->ah);
-        if (r->voiced) tr_at(tr_at(tr_at(av, 0, r->av), dur, r->av), dur + 10 * k, nx->av);
+        if (glot) catch_at(av, dur, k, nx->av);
+        else if (r->voiced) tr_at(tr_at(tr_at(av, 0, r->av), dur, r->av), dur + 10 * k, nx->av);
         else tr_at(tr_at(tr_at(av, 0, 0), dur - 10 * k, 0), dur + 10 * k, nx->av);
         tr_at(af, 0, 0);
         tr_at(tr_at(tr_at(w, 0, 1), dur, 1), dur + tr, 0);
-        tr_at(nz, 0, 0);
+        tr_at(tr_at(nz, 0, 0), dur, 0);
         end = dmax(dur + 10 * k, dur + tr);
+        if (glot) end = dmax(end, dur + (GLOT_CATCH + GLOT_RISE) * k);
         break;
     case MANNER_NASAL:
         tr_at(tr_at(tr_at(av, 0, r->av), dur, r->av), dur + 10 * k, nx->av);
@@ -387,18 +467,21 @@ static void onset_tracks(const TaudConsonant *r, bool first, const NextStart *nx
         tr_at(tr_at(tr_at(tr_at(w, 0, 1), dur, 1), dur + 5 * k, 0.5), dur + tr, 0);
         tr_at(ah, 0, 0); tr_at(af, 0, 0);
         end = dmax(dur + 10 * k, dur + tr);
+        sonorant = true;
         break;
     case MANNER_APPROX:
         tr_at(tr_at(tr_at(av, 0, r->av), dur, r->av), dur + tr * 0.5, nx->av);
         tr_at(tr_at(tr_at(w, 0, 1), dur, 1), dur + tr, 0);
-        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(tr_at(nz, 0, 0), dur, 0);
         end = dur + tr;
+        sonorant = true;
         break;
     case MANNER_TAP:
         tr_at(tr_at(tr_at(av, 0, 0.2), dur, 0.2), dur + 5 * k, nx->av);
         tr_at(tr_at(tr_at(w, 0, 1), dur, 1), dur + tr, 0);
-        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(tr_at(nz, 0, 0), dur, 0);
         end = dmax(dur + 5 * k, dur + tr);
+        sonorant = true;
         break;
     case MANNER_TRILL: {
         double c = dur, shut = c * 0.375, tail;
@@ -406,33 +489,148 @@ static void onset_tracks(const TaudConsonant *r, bool first, const NextStart *nx
               c, 0.12), c + shut, 0.12), c + shut + 3 * k, nx->av);
         tail = c + shut + 3 * k;
         tr_at(tr_at(tr_at(w, 0, 1), tail, 1), tail + tr, 0);
-        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(tr_at(nz, 0, 0), tail, 0);
         end = tail + tr;
+        sonorant = true;
         break;
     }
     default: {
         double cl = first ? 0 : 30 * k;
         tr_at(tr_at(tr_at(av, 0, 0), cl, 0), cl + 3 * k, nx->av);
         tr_at(w, 0, 0);
-        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(tr_at(nz, 0, 0), cl, 0);
         end = cl + 3 * k;
         break;
     }
     }
     sg->end = end;
-    tr_close(w, end, 0);
+    sg->loop = 0;
     tr_close(av, end, nx->av);
+    /* A glottalised sonorant is said after a glottal stop: the catch first. */
+    if (glot && sonorant) catch_track(av, GLOT_CATCH * k, (GLOT_CATCH + GLOT_RISE) * k);
+    tr_close(w, end, 0);
     tr_close(ah, end, nx->ah);
     tr_close(af, end, nx->af);
     tr_close(nz, end, nx->nz);
 }
 
-/* A coda consonant's tracks (codaTracks). */
-static void coda_tracks(const TaudConsonant *r, double k, TaudFormantSegment *sg)
+/* A NUCLEUS's tracks (nucleusTracks): the consonant a syllable with no vowel
+ * is held on. It starts as an onset consonant does and then holds what it can
+ * sustain; past `end` every track holds, but a trill's time wraps back by
+ * `loop` ms. */
+static void nucleus_tracks(const TaudConsonant *r, bool first, double k, int art, TaudFormantSegment *sg)
+{
+    TaudFormantTrack *w = &sg->w, *av = &sg->av, *ah = &sg->ah, *af = &sg->af, *nz = &sg->nz;
+    double L = db_gain(r->lvl);
+    double dur = r->dur * k, end, loop = 0;
+    bool glot = art == ART_GLOTTAL, sonorant = false;
+    tr_reset(w); tr_reset(av); tr_reset(ah); tr_reset(af); tr_reset(nz);
+    tr_at(w, 0, 1);
+    switch (r->manner) {
+    case MANNER_STOP: {
+        double cl = first ? 0 : CLOSURE_MS * k;
+        double tb = cl + r->burst * k;
+        tr_at(tr_at(tr_at(tr_at(tr_at(af, 0, 0), cl, 0), cl, L), tb, 0.3 * L), tb + 2 * k, 0);
+        tr_at(ah, 0, 0);
+        if (glot) {
+            double tv = tb + GLOT_LAG * k;
+            tr_at(tr_at(tr_at(av, 0, 0), tv, 0), tv + GLOT_RISE * k, r->voiced ? 1 : 0);
+            end = tv + GLOT_RISE * k;
+        } else if (r->voiced) {
+            double a = cl > 0 ? 0.25 : 0.3;
+            tr_at(tr_at(tr_at(tr_at(av, 0, a), cl, a), tb, 0.3), tb + 10 * k, 1);
+            end = tb + 10 * k;
+        } else {
+            tr_at(av, 0, 0);
+            if (r->vot > 0) {
+                double La = L * db_gain(ASPIRATION_DB);
+                tr_at(tr_at(tr_at(ah, tb, 0), tb + 3 * k, La), tb + 10 * k, 0.7 * La);
+            }
+            end = tb + 10 * k;
+        }
+        tr_at(nz, 0, 0);
+        break;
+    }
+    case MANNER_AFFRICATE: {
+        double cl = first ? 0 : CLOSURE_MS * k;
+        double tb = cl + r->burst * k;
+        tr_at(tr_at(tr_at(tr_at(tr_at(af, 0, 0), cl, 0), cl, L), tb, 0.8 * L), tb + 10 * k, L);
+        tr_at(av, 0, r->voiced && !glot ? 0.3 : 0);
+        tr_at(ah, 0, 0); tr_at(nz, 0, 0);
+        end = tb + 10 * k;
+        break;
+    }
+    case MANNER_FRICATIVE:
+        tr_at(tr_at(af, 0, 0), 10 * k, L);
+        tr_at(av, 0, r->voiced && !glot ? r->av : 0);
+        tr_at(ah, 0, 0); tr_at(nz, 0, 0);
+        end = 10 * k;
+        break;
+    case MANNER_ASPIRATE:
+        tr_at(tr_at(ah, 0, 0), 10 * k, L);
+        tr_at(av, 0, r->voiced && !glot ? r->av : 0);
+        tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        end = 10 * k;
+        break;
+    case MANNER_NASAL:
+        tr_at(av, 0, 1);
+        tr_at(nz, 0, 1);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0);
+        end = 0;
+        sonorant = true;
+        break;
+    case MANNER_APPROX:
+        tr_at(av, 0, 1);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        end = 0;
+        sonorant = true;
+        break;
+    case MANNER_TAP:            /* the tap, then the voicing held where it let go */
+        tr_at(tr_at(tr_at(av, 0, 0.2), dur, 0.2), dur + 5 * k, 1);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        end = dur + 5 * k;
+        sonorant = true;
+        break;
+    case MANNER_TRILL: {        /* two cycles; the second repeats */
+        double c = dur, shut = c * 0.375;
+        int n;
+        for (n = 0; n < 2; n++) {
+            double o = n * c;
+            tr_at(tr_at(tr_at(tr_at(av, o, 0.12), o + shut, 0.12), o + shut + 3 * k, 0.7), o + c - 3 * k, 0.7);
+        }
+        tr_at(av, 2 * c, 0.12);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        end = 2 * c;
+        loop = c;
+        sonorant = true;
+        break;
+    }
+    default:                    /* the glottis shut, and nothing to hold */
+        tr_at(av, 0, 0);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        end = 0;
+        break;
+    }
+    sg->end = end;
+    sg->loop = loop;
+    tr_close(av, end, av->p[av->n - 1]);
+    if (glot && sonorant) catch_track(av, GLOT_CATCH * k, (GLOT_CATCH + GLOT_RISE) * k);
+    tr_close(w, end, w->p[w->n - 1]);
+    tr_close(ah, end, ah->p[ah->n - 1]);
+    tr_close(af, end, af->p[af->n - 1]);
+    tr_close(nz, end, nz->p[nz->n - 1]);
+}
+
+/* A CODA consonant's tracks (codaTracks): from the sound before it — the
+ * vowel, or a held nucleus with voicing v0 and nasality z0 — into silence.
+ * `art` is the coda's own articulation (CODA_*). */
+static void coda_tracks(const TaudConsonant *r, double k, double v0, double z0, int art, TaudFormantSegment *sg)
 {
     TaudFormantTrack *w = &sg->w, *av = &sg->av, *ah = &sg->ah, *af = &sg->af, *nz = &sg->nz;
     double L = db_gain(r->lvl);
     double tr = r->trans * k, dur = r->dur * k, end;
+    bool glot = art == CODA_GLOTTAL;
+    double gs = GLOT_STOP * k;
     tr_reset(w); tr_reset(av); tr_reset(ah); tr_reset(af); tr_reset(nz);
     switch (r->manner) {
     case MANNER_STOP:
@@ -440,12 +638,17 @@ static void coda_tracks(const TaudConsonant *r, double k, TaudFormantSegment *sg
         double tc = tr + CLOSURE_MS * k;
         double tb = tc + r->burst * k;
         tr_at(tr_at(tr_at(w, 0, 0), tr, 0.5), tr + 5 * k, 1);
-        if (r->voiced) tr_at(tr_at(tr_at(tr_at(tr_at(av, 0, 1), tr, 1), tr + 8 * k, 0.25), tc, 0.2), tc + 5 * k, 0);
-        else tr_at(tr_at(tr_at(av, 0, 1), tr, 1), tr + 8 * k, 0);
-        if (r->manner == MANNER_STOP) {
+        if (glot) tr_at(tr_at(tr_at(av, 0, v0), tr, v0), tr + gs, 0);
+        else if (r->voiced) tr_at(tr_at(tr_at(tr_at(tr_at(av, 0, v0), tr, v0), tr + 8 * k, 0.25), tc, 0.2), tc + 5 * k, 0);
+        else tr_at(tr_at(tr_at(av, 0, v0), tr, v0), tr + 8 * k, 0);
+        if (art == CODA_UNRELEASED) {
+            tr_at(af, 0, 0);
+            tr_at(ah, 0, 0);
+            end = r->voiced ? tc + 5 * k : tr + 8 * k;
+        } else if (r->manner == MANNER_STOP) {
             tr_at(tr_at(tr_at(tr_at(tr_at(af, 0, 0), tc, 0), tc, 0.7 * L), tb, 0.2 * L), tb + 2 * k, 0);
             tr_at(ah, 0, 0);
-            if (!r->voiced && r->vot > 0) {
+            if (!glot && !r->voiced && r->vot > 0) {
                 double La = L * db_gain(ASPIRATION_DB);
                 tr_at(tr_at(tr_at(ah, tb, 0), tb + 2 * k, 0.5 * La), tb + 30 * k, 0);
             }
@@ -455,70 +658,107 @@ static void coda_tracks(const TaudConsonant *r, double k, TaudFormantSegment *sg
             tr_at(ah, 0, 0);
             end = tb + dur + 20 * k;
         }
-        tr_at(nz, 0, 0);
+        tr_at(tr_at(nz, 0, z0), tr + 5 * k, 0);
         break;
     }
     case MANNER_FRICATIVE: {
         double a = dmax(tr - 15 * k, 0);
         tr_at(tr_at(w, 0, 0), tr, 1);
-        if (r->voiced) tr_at(tr_at(tr_at(tr_at(av, 0, 1), tr, r->av), tr + dur, 0.7 * r->av), tr + dur + 30 * k, 0);
-        else tr_at(tr_at(tr_at(av, 0, 1), a, 1), tr + 5 * k, 0);
+        if (glot) tr_at(tr_at(tr_at(av, 0, v0), a, v0), a + gs, 0);
+        else if (r->voiced) tr_at(tr_at(tr_at(tr_at(av, 0, v0), tr, r->av), tr + dur, 0.7 * r->av), tr + dur + 30 * k, 0);
+        else tr_at(tr_at(tr_at(av, 0, v0), a, v0), tr + 5 * k, 0);
         tr_at(tr_at(tr_at(tr_at(tr_at(af, 0, 0), a, 0), tr + 5 * k, L), tr + dur, 0.8 * L), tr + dur + 30 * k, 0);
-        tr_at(ah, 0, 0); tr_at(nz, 0, 0);
+        tr_at(ah, 0, 0); tr_at(tr_at(nz, 0, z0), tr, 0);
         end = tr + dur + 30 * k;
         break;
     }
     case MANNER_ASPIRATE:
         tr_at(tr_at(w, 0, 0), 15 * k, 1);
-        if (r->voiced) tr_at(tr_at(tr_at(tr_at(av, 0, 1), 20 * k, r->av), dur, 0.5 * r->av), dur + 20 * k, 0);
-        else tr_at(tr_at(av, 0, 1), 20 * k, 0);
+        if (glot) tr_at(tr_at(av, 0, v0), gs, 0);
+        else if (r->voiced) tr_at(tr_at(tr_at(tr_at(av, 0, v0), 20 * k, r->av), dur, 0.5 * r->av), dur + 20 * k, 0);
+        else tr_at(tr_at(av, 0, v0), 20 * k, 0);
         tr_at(tr_at(tr_at(tr_at(ah, 0, 0), 10 * k, L), dur, 0.5 * L), dur + 30 * k, 0);
-        tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        tr_at(af, 0, 0); tr_at(tr_at(nz, 0, z0), 15 * k, 0);
         end = dur + 30 * k;
         break;
     case MANNER_NASAL:
         tr_at(tr_at(w, 0, 0), tr, 1);
-        tr_at(tr_at(tr_at(nz, 0, 0), dmax(tr - 5 * k, 0), 0), tr, 1);
-        tr_at(tr_at(tr_at(tr_at(av, 0, 1), tr, r->av), tr + dur, 0.8 * r->av), tr + dur + 40 * k, 0);
+        tr_at(tr_at(tr_at(nz, 0, z0), dmax(tr - 5 * k, 0), z0), tr, 1);
+        tr_at(tr_at(tr_at(av, 0, v0), tr, r->av), tr + dur, 0.8 * r->av);
+        end = tr + dur + (glot ? gs : 40 * k);
+        tr_at(av, end, 0);
         tr_at(ah, 0, 0); tr_at(af, 0, 0);
-        end = tr + dur + 40 * k;
         break;
     case MANNER_APPROX:
         tr_at(tr_at(w, 0, 0), tr, 1);
-        tr_at(tr_at(tr_at(tr_at(av, 0, 1), tr, r->av), tr + dur, 0.8 * r->av), tr + dur + 40 * k, 0);
-        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
-        end = tr + dur + 40 * k;
+        tr_at(tr_at(tr_at(av, 0, v0), tr, r->av), tr + dur, 0.8 * r->av);
+        end = tr + dur + (glot ? gs : 40 * k);
+        tr_at(av, end, 0);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(tr_at(nz, 0, z0), tr, 0);
         break;
     case MANNER_TAP:
         tr_at(tr_at(w, 0, 0), tr, 1);
-        tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(av, 0, 1), tr, 1), tr + 3 * k, 0.2), tr + dur, 0.2), tr + dur + 3 * k, 0.6),
-              tr + dur + 40 * k, 0);
-        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
-        end = tr + dur + 40 * k;
+        tr_at(tr_at(tr_at(tr_at(av, 0, v0), tr, v0), tr + 3 * k, 0.2), tr + dur, 0.2);
+        if (glot) {
+            end = tr + dur + gs;
+        } else {
+            tr_at(av, tr + dur + 3 * k, 0.6);
+            end = tr + dur + 40 * k;
+        }
+        tr_at(av, end, 0);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(tr_at(nz, 0, z0), tr, 0);
         break;
     case MANNER_TRILL: {
         double c = dur, shut = c * 0.375;
         tr_at(tr_at(w, 0, 0), tr, 1);
-        tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(av, 0, 1), tr, 0.7), tr + 3 * k, 0.12),
-              tr + shut, 0.12), tr + shut + 3 * k, 0.7), tr + c - 3 * k, 0.7), tr + c, 0.12), tr + c + shut, 0.12),
-              tr + c + shut + 3 * k, 0.6), tr + c + shut + 35 * k, 0);
-        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
-        end = tr + c + shut + 35 * k;
+        tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(av, 0, v0), tr, 0.7), tr + 3 * k, 0.12),
+              tr + shut, 0.12), tr + shut + 3 * k, 0.7), tr + c - 3 * k, 0.7), tr + c, 0.12), tr + c + shut, 0.12);
+        if (glot) {
+            end = tr + c + shut + gs;
+        } else {
+            tr_at(av, tr + c + shut + 3 * k, 0.6);
+            end = tr + c + shut + 35 * k;
+        }
+        tr_at(av, end, 0);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(tr_at(nz, 0, z0), tr, 0);
         break;
     }
     default:
         tr_at(w, 0, 0);
-        tr_at(tr_at(av, 0, 1), 6 * k, 0);
-        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(nz, 0, 0);
+        tr_at(tr_at(av, 0, v0), 6 * k, 0);
+        tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(tr_at(nz, 0, z0), 6 * k, 0);
         end = 6 * k;
         break;
     }
     sg->end = end;
+    sg->loop = 0;
     tr_close(w, end, 1);
     tr_close(av, end, 0);
     tr_close(ah, end, 0);
     tr_close(af, end, 0);
     tr_close(nz, end, 0);
+}
+
+/* A coda after a nucleus that hisses (afterRelease): the hiss lets go over
+ * `rel` ms first, voicing v0 and nasality z0 held, then the coda's tracks. */
+static void shift_track(TaudFormantTrack *t, double rel, double v)
+{
+    TaudFormantTrack out;
+    int i;
+    out.n = 0;
+    tr_push(&out, 0, v);
+    for (i = 0; i < t->n; i += 2) tr_push(&out, t->p[i] + rel, t->p[i + 1]);
+    *t = out;
+}
+
+static void after_release(TaudFormantSegment *sg, double rel, double v0, double a0, double h0, double z0)
+{
+    sg->end = sg->end + rel;
+    shift_track(&sg->w, rel, 0);
+    shift_track(&sg->av, rel, v0);
+    shift_track(&sg->ah, rel, h0);
+    shift_track(&sg->af, rel, a0);
+    shift_track(&sg->nz, rel, z0);
 }
 
 static double timing_scale(int b) { return js_pow(2, (b - 128) / 64.0); }
@@ -569,6 +809,11 @@ void te_formant_tables_init(TaudFormantTables *T, int rate)
     for (h = 0; h < 4; h++)
         for (c = 0; c < 4; c++)
             for (n = 0; n < 2; n++) T->logCard[h][c][n] = js_log(CARDINAL_VOWELS[h][c][n]);
+    /* The tongue a secondary articulation holds behind a consonant (ART_F):
+     * ART_PALATAL [i]'s, ART_DARK the back of the tongue drawn back, midway
+     * between [ʌ] and [ɑ]. Its formants at a man's size. */
+    vowel_formants(T, 255, 0, 0, T->artF[ART_PALATAL], false);
+    vowel_formants(T, 0, 212, 0, T->artF[ART_DARK], false);
     for (i = 0; i < ISO226_N; i++) {
         double af = ISO226_AF[i], lu = ISO226_LU[i], tf = ISO226_TF[i];
         double A = 4.47e-3 * (js_pow(10, 0.025 * LOUDNESS_PHON) - 1.15) +
@@ -604,6 +849,10 @@ static void next_start_of(const TaudFormantSegment *s, NextStart *nx)
     nx->av = s->av.p[1]; nx->ah = s->ah.p[1]; nx->af = s->af.p[1]; nx->nz = s->nz.p[1];
 }
 
+/* The articulation blendInto gives a segment (tractArt): a secondary
+ * articulation's tongue — the glottal one changes the tracks, not the tract. */
+static int tract_art(int a) { return a == ART_PALATAL || a == ART_DARK ? a : ART_NONE; }
+
 /* A fresh tract, as `new FormantState()` leaves one. */
 void te_formant_state_init(TaudFormantState *st)
 {
@@ -616,22 +865,83 @@ void te_formant_state_init(TaudFormantState *st)
     st->sgDue = true;
     st->nGain = 1.0;
     st->nSeed = NOISE_SEED;
+    st->nucleus = -1;
+    st->srcKind = CHIP_NONE;
+}
+
+/* The coda a record gives a note (buildCoda): slot 2's consonant, from the
+ * vowel — or, in a syllable with no vowel, from its nucleus as it holds, a
+ * hissing nucleus letting its hiss go first. False with no coda consonant. */
+static bool build_coda(TaudFormantState *st, const TaudFormantPatch *patch, double k)
+{
+    const TaudConsonant *cr = consonant(patch->slots[2].cons);
+    TaudFormantSegment *seg = &st->coda;
+    const TaudFormantSegment *nuc;
+    int art;
+    if (cr == NULL) return false;
+    art = patch->codaArt;
+    seg->row = cr;
+    seg->slot = patch->slots[2];
+    seg->next = -1;
+    seg->art = art == CODA_DARK ? ART_DARK : ART_NONE;
+    seg->noiseAt = 0;
+    seg->prevRow = NULL;
+    seg->prevArt = ART_NONE;
+    if (st->nucleus < 0) {
+        double z0 = patch->nasal && has_vowel(patch) ? 1 : 0;
+        coda_tracks(cr, k, 1, z0, art, seg);
+        return true;
+    }
+    nuc = &st->onset[st->nucleus];
+    {
+        double v0 = nuc->av.p[nuc->av.n - 1], z0 = nuc->nz.p[nuc->nz.n - 1];
+        double a0 = nuc->af.p[nuc->af.n - 1], h0 = nuc->ah.p[nuc->ah.n - 1];
+        bool hiss = a0 > 0 || h0 > 0;
+        coda_tracks(cr, k, v0, z0, art, seg);
+        if (hiss) {
+            after_release(seg, NUCLEUS_RELEASE * k, v0, a0, h0, z0);
+            seg->noiseAt = NUCLEUS_RELEASE * k;
+            seg->prevRow = nuc->row;
+            seg->prevArt = nuc->art;
+        }
+    }
+    return true;
+}
+
+/* The coda of a syllable with nothing to say: over before it starts. */
+static void silent_coda(TaudFormantSegment *seg)
+{
+    memset(seg, 0, sizeof *seg);
+    seg->next = -1;
+    tr_push(&seg->w, 0, 1);
+    tr_push(&seg->av, 0, 0);
+    tr_push(&seg->ah, 0, 0);
+    tr_push(&seg->af, 0, 0);
+    tr_push(&seg->nz, 0, 0);
 }
 
 void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch)
 {
     double k = timing_scale(patch->timing);
+    bool vowel = has_vowel(patch), coda = true, nasal;
     const TaudConsonant *rows[2];
     int rowSlot[2], nrows = 0, i, next;
     NextStart nx;
-    const TaudConsonant *cr;
     st->patch = patch;
     for (i = 0; i < 2; i++) {
         const TaudConsonant *r = consonant(patch->slots[i].cons);
         if (r != NULL) { rows[nrows] = r; rowSlot[nrows] = i; nrows++; }
     }
-    st->sv = patch->semivowel;
+    /* With no vowel, the last onset consonant is the nucleus — or, with no
+     * onset, the coda's consonant, which then leaves no coda after it. */
+    if (!vowel && nrows == 0) {
+        const TaudConsonant *r = consonant(patch->slots[2].cons);
+        if (r != NULL) { rows[nrows] = r; rowSlot[nrows] = 2; nrows++; coda = false; }
+    }
+    /* The glide, if any; a syllable with no vowel has none. */
+    st->sv = vowel ? patch->semivowel : 0;
     st->svT = 0.0;
+    nasal = vowel && patch->nasal;
     if (st->sv != 0) {
         const TaudConsonant *r = consonant(SEMIVOWELS[st->sv].row);
         double dur = r->dur * k, tr = r->trans * k;
@@ -640,33 +950,37 @@ void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
         tr_close(tr_at(tr_at(tr_at(&st->svW, 0, 1), dur, 1), dur + tr, 0), st->svEnd, 0);
         tr_reset(&st->svAv);
         tr_close(tr_at(tr_at(tr_at(&st->svAv, 0, r->av), dur, r->av), dur + tr * 0.5, 1), st->svEnd, 1);
-        nx.av = st->svAv.p[1]; nx.ah = 0; nx.af = 0; nx.nz = 0;
+        nx.av = st->svAv.p[1]; nx.ah = 0; nx.af = 0; nx.nz = nasal ? 1 : 0;
     } else {
-        nx.av = 1; nx.ah = 0; nx.af = 0; nx.nz = 0;
+        nx.av = 1; nx.ah = 0; nx.af = 0; nx.nz = nasal ? 1 : 0;
     }
+    /* Built back to front; the last consonant carries the secondary
+     * articulation, and without a vowel it is the nucleus, and holds. */
     next = -1;
     for (i = nrows - 1; i >= 0; i--) {
         TaudFormantSegment *s = &st->onset[i];
+        int art = i == nrows - 1 ? patch->secondary : ART_NONE;
         s->row = rows[i];
         s->slot = patch->slots[rowSlot[i]];
-        onset_tracks(rows[i], i == 0, &nx, k, s);
+        if (!vowel && i == nrows - 1) nucleus_tracks(rows[i], i == 0, k, art, s);
+        else onset_tracks(rows[i], i == 0, &nx, k, art, s);
+        s->art = tract_art(art);
+        s->noiseAt = 0;
+        s->prevRow = NULL;
+        s->prevArt = ART_NONE;
         s->next = next;
         next = i;
         next_start_of(s, &nx);
     }
     st->onsetCount = nrows;
     st->seg = 0;
-    cr = consonant(patch->slots[2].cons);
-    st->hasCoda = cr != NULL;
-    if (cr != NULL) {
-        st->coda.row = cr;
-        st->coda.slot = patch->slots[2];
-        st->coda.next = -1;
-        coda_tracks(cr, k, &st->coda);
-    }
+    st->nucleus = !vowel && nrows > 0 ? nrows - 1 : -1;
+    st->held = false;
+    st->hasCoda = coda ? build_coda(st, patch, k) : false;
     st->phase = nrows > 0 ? PHASE_ONSET : PHASE_VOWEL;
     st->t = 0.0;
     st->codaVeto = false;
+    st->codaNoise = false;
     st->fresh = true;
     st->upd = imax(1, (int)js_round(e->rate / 1000.0));
     st->ctl = 0;
@@ -680,7 +994,73 @@ void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
     memset(st->cy, 0, sizeof st->cy);
     memset(st->by, 0, sizeof st->by);
     st->nOn = false; st->nZ = 0.0;
+    /* No vowel and no consonant: nothing to say. The syllable is over at once. */
+    if (!vowel && nrows == 0) {
+        st->phase = PHASE_CODA;
+        silent_coda(&st->coda);
+        st->hasCoda = true;
+        st->codaNoise = true;
+    }
     if (st->phase == PHASE_ONSET) start_noise(e, st, &st->onset[0]);
+}
+
+/* ── the glottal source as a chip channel ── */
+
+/* The instrument a formant instrument is sung from (formantChipSource), or
+ * NULL when it sings with its own sample: the header names none, or itself,
+ * or an instrument that is not a chip one. */
+const TaudInst *te_formant_chip_source(const TaudEngine *e, const TaudInst *inst)
+{
+    int i = inst->formant->srcInst;
+    const TaudInst *src;
+    if (i < 1 || i > 1023 || i == inst->index) return NULL;
+    src = &e->instruments[i];
+    return inst_is_chip(src) ? src : NULL;
+}
+
+/* The rate a chip source plays the part of the sample's rate with: its own
+ * C2SPD, 0 reading as the tracker convention. */
+int te_formant_chip_rate(const TaudInst *src)
+{
+    return src->samplingRate == 0 ? OPL_C4_RATE : src->samplingRate;
+}
+
+static int chip_kind_of(const TaudInst *chip) { return chip->opl != NULL ? CHIP_OPL : CHIP_PSG; }
+
+static void chip_key_on(TaudFormantState *st, bool carry)
+{
+    if (st->srcKind == CHIP_OPL) te_opl_key_on(&st->srcOpl, st->srcOpl.patch, carry);
+    else te_psg_key_on(&st->srcPsg, st->srcPsg.patch, carry);
+}
+
+/* Key the note's glottal source (formantKeySource): a chip channel playing
+ * `chip`'s patch from silence — or none, the sample being the source. A
+ * channel of the same kind is reused, as the JS reuses its state object. */
+void te_formant_key_source(TaudFormantState *st, const TaudInst *chip)
+{
+    int kind;
+    if (chip == NULL) { st->srcKind = CHIP_NONE; return; }
+    kind = chip_kind_of(chip);
+    if (st->srcKind != kind) {
+        st->srcKind = kind;
+        if (kind == CHIP_OPL) te_opl_state_init(&st->srcOpl);
+        else te_psg_state_init(&st->srcPsg);
+    }
+    if (kind == CHIP_OPL) te_opl_key_on(&st->srcOpl, chip->opl, false);
+    else te_psg_key_on(&st->srcPsg, chip->psg, false);
+    st->sgDue = true;
+}
+
+/* An instrument byte without a retrigger hands the note a new record's source
+ * (formantRelatchSource): a channel already sounding takes the new patch
+ * where it stands; otherwise as a fresh key-on. */
+void te_formant_relatch_source(TaudFormantState *st, const TaudInst *chip)
+{
+    if (chip == NULL) { st->srcKind = CHIP_NONE; return; }
+    if (st->srcKind != chip_kind_of(chip)) { te_formant_key_source(st, chip); return; }
+    if (st->srcKind == CHIP_OPL) { st->srcOpl.patch = chip->opl; st->srcOpl.gen = -1; }
+    else { st->srcPsg.patch = chip->psg; st->srcPsg.gen = -1; }
+    st->sgDue = true;
 }
 
 void te_formant_restart(TaudEngine *e, TaudFormantState *st)
@@ -693,6 +1073,11 @@ void te_formant_restart(TaudEngine *e, TaudFormantState *st)
     te_formant_note_on(e, st, st->patch);
     st->vFront = f; st->vOpen = o; st->vRound = r; st->ownVowel = own;
     st->sg = sg; st->sm = sm; st->sgDue = due;
+    /* A chip source is re-keyed as Q re-keys an OPL note: the attack from
+     * where each envelope stands, the phase from zero (§5.5.2). */
+    if (st->srcKind == CHIP_OPL ? st->srcOpl.patch != NULL : st->srcKind == CHIP_PSG && st->srcPsg.patch != NULL) {
+        chip_key_on(st, true);
+    }
 }
 
 static void formant_glide_to(TaudFormantState *st, double open, double front, double round)
@@ -718,21 +1103,30 @@ void te_formant_relatch(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
     if (st->glideLeft > 0) { st->ownVowel = true; st->rejoin = true; }
     else { st->ownVowel = false; st->rejoin = false; }
     if (st->phase == PHASE_ONSET || st->phase == PHASE_VOWEL) {
-        const TaudConsonant *cr = consonant(patch->slots[2].cons);
-        st->hasCoda = cr != NULL;
-        if (cr != NULL) {
-            st->coda.row = cr;
-            st->coda.slot = patch->slots[2];
-            st->coda.next = -1;
-            coda_tracks(cr, timing_scale(patch->timing), &st->coda);
-        }
+        st->hasCoda = build_coda(st, patch, timing_scale(patch->timing));
     }
 }
 
+/* A sampled note handed a formant instrument mid-note: the tract starts at
+ * the vowel — or a syllable with no vowel at its nucleus, holding — with the
+ * coda ready. */
 void te_formant_start_at_vowel(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch)
 {
     te_formant_note_on(e, st, patch);
     st->sv = 0;
+    if (st->phase == PHASE_CODA) return;   /* nothing to say */
+    if (st->nucleus >= 0) {
+        if (st->nucleus != 0) st->onset[0] = st->onset[st->nucleus];
+        st->onset[0].next = -1;
+        st->nucleus = 0;
+        st->onsetCount = 1;
+        st->seg = 0;
+        st->phase = PHASE_ONSET;
+        st->t = st->onset[0].end;
+        st->held = true;
+        start_noise(e, st, &st->onset[0]);
+        return;
+    }
     st->onsetCount = 0;
     st->seg = 0;
     st->phase = PHASE_VOWEL;
@@ -986,6 +1380,8 @@ static void source_harmonics(TaudEngine *e, int64_t p, int64_t span, bool whole,
     T->memoCount++;
 }
 
+static void measure_chip_source(TaudEngine *e, const TaudVoice *voice, TaudFormantState *st);
+
 static void measure_source(TaudEngine *e, const TaudVoice *voice, TaudFormantState *st)
 {
     int mode = voice->activeLoopMode & 3;
@@ -994,6 +1390,7 @@ static void measure_source(TaudEngine *e, const TaudVoice *voice, TaudFormantSta
     int64_t lim = SAMPLE_BIN_TOTAL - base;
     int64_t p0 = voice->activeSamplePlayStart, at, n;
     bool whole = false;
+    if (st->srcKind != CHIP_NONE) { measure_chip_source(e, voice, st); return; }
 #define CUT(x) ((int64_t)dmax(0, dmin(dmin((double)(x), voice->activeSampleLength), (double)lim)))
     if (looped) {
         int64_t a = voice->activeSampleLoopStart, preN;
@@ -1019,10 +1416,112 @@ static void measure_source(TaudEngine *e, const TaudVoice *voice, TaudFormantSta
     source_harmonics(e, at, n, whole, voice->activeSamplingRate / LINEAR_FREQ_C4_HZ, st);
 }
 
+#define CHIP_MEASURE 4096
+
+/* measureSource for a source that is a chip channel (measureChipSource): the
+ * note's patch run apart — from key-on, at the note's rate, at unity volume,
+ * on a channel of its own — for CHIP_MEASURE output frames, measured as a
+ * one-shot is: the gain from the loudest window, its harmonics from the same
+ * window, Hann-windowed and read at k ÷ P cycles a frame. */
+static void measure_chip_source(TaudEngine *e, const TaudVoice *voice, TaudFormantState *st)
+{
+    TaudFormantTables *T = &e->formantTables;
+    const void *patch = st->srcKind == CHIP_OPL ? (const void *)st->srcOpl.patch : (const void *)st->srcPsg.patch;
+    int gen = st->srcKind == CHIP_OPL ? st->srcOpl.patch->gen : st->srcPsg.patch->gen;
+    int rtGen = st->srcKind == CHIP_PSG ? st->srcPsg.patch->rtGen : 0;
+    double pr = voice->snapPlaybackRate ? voice->playbackRate : voice->currentPlaybackRate;
+    double *x = T->chipBuf, *w = st->hw, *y = T->dft;
+    double best = -1.0, mean, ac, P, sum = 0.0;
+    int at = 0, o, i, j, K;
+    /* A pure memo, keyed as the JS keys it: the patch, its decode (and a PSG
+     * patch's overlay), the rate. */
+    for (j = 0; j < T->chipMemoCount; j++) {
+        if (T->chipMemo[j].patch == patch && T->chipMemo[j].kind == st->srcKind && T->chipMemo[j].gen == gen &&
+            T->chipMemo[j].rtGen == rtGen && T->chipMemo[j].pr == pr) {
+            st->sm = T->chipMemo[j].sm;
+            st->sg = T->chipMemo[j].sg;
+            memcpy(w, T->chipMemo[j].w, (size_t)(T->chipMemo[j].K + 1) * sizeof *w);
+            st->hwK = T->chipMemo[j].K;
+            return;
+        }
+    }
+    if (st->srcKind == CHIP_PSG) {
+        /* A PSG pair keeps its internal status across key-ons, so it is
+         * measured from rest, as a fresh lane meets it. */
+        TaudPsgState psg;
+        te_psg_state_init(&psg);
+        te_psg_key_on(&psg, st->srcPsg.patch, false);
+        for (i = 0; i < CHIP_MEASURE; i++) x[i] = te_psg_render(e, &psg, i, pr, false);
+    } else {
+        TaudOplState opl;
+        te_opl_state_init(&opl);
+        te_opl_key_on(&opl, st->srcOpl.patch, false);
+        for (i = 0; i < CHIP_MEASURE; i++) x[i] = te_opl_render(e, &opl, i, pr, 1.0, false);
+    }
+    /* The loudest window, every half window; the first of equals wins. */
+    for (o = 0; o + SOURCE_WINDOW <= CHIP_MEASURE; o += SOURCE_WINDOW >> 1) {
+        double s1 = 0.0, sq = 0.0, m;
+        for (i = 0; i < SOURCE_WINDOW; i++) { double v = x[o + i]; s1 += v; sq += v * v; }
+        m = s1 / SOURCE_WINDOW;
+        ac = sq / SOURCE_WINDOW - m * m;
+        if (ac > best) { best = ac; at = o; }
+    }
+    {
+        double s1 = 0.0, sq = 0.0;
+        for (i = 0; i < SOURCE_WINDOW; i++) { double v = x[at + i]; s1 += v; sq += v * v; }
+        mean = s1 / SOURCE_WINDOW;
+        ac = sq / SOURCE_WINDOW - mean * mean;
+    }
+    st->sm = mean;
+    st->sg = ac > 1e-12 ? dmin(dmax(FORMANT_LEVEL / sqrt(ac), 1.0 / SOURCE_GAIN_MAX), SOURCE_GAIN_MAX) : 1.0;
+    /* The period in output frames: the chip sounds pr × rate × 261.63 ÷ 8363 Hz. */
+    P = pr > 0 ? OPL_C4_RATE / (pr * LINEAR_FREQ_C4_HZ) : 0;
+    K = P >= 2 ? (int)dmin(NORM_HARMONICS, floor(P / 2)) : 0;
+    if (K >= 1) {
+        int k;
+        for (i = 0; i < SOURCE_WINDOW; i++) {
+            y[i] = (x[at + i] - mean) * (0.5 - 0.5 * js_cos((2 * PI * i) / SOURCE_WINDOW));
+        }
+        for (k = 1; k <= K; k++) {
+            double om = (2 * PI * k) / P;
+            double c1 = js_cos(om), s1 = js_sin(om);
+            double c = 1.0, s = 0.0, re = 0.0, im = 0.0;
+            for (i = 0; i < SOURCE_WINDOW; i++) {
+                double nc;
+                re += y[i] * c;
+                im -= y[i] * s;
+                nc = c * c1 - s * s1;
+                s = s * c1 + c * s1;
+                c = nc;
+            }
+            w[k] = re * re + im * im;
+            sum += w[k];
+        }
+    }
+    if (sum > 0) st->hwK = K;
+    else saw_harmonics(st);
+    if (T->chipMemoCount >= 32) T->chipMemoCount = 0;
+    T->chipMemo[T->chipMemoCount].patch = patch;
+    T->chipMemo[T->chipMemoCount].kind = st->srcKind;
+    T->chipMemo[T->chipMemoCount].gen = gen;
+    T->chipMemo[T->chipMemoCount].rtGen = rtGen;
+    T->chipMemo[T->chipMemoCount].pr = pr;
+    T->chipMemo[T->chipMemoCount].sm = st->sm;
+    T->chipMemo[T->chipMemoCount].sg = st->sg;
+    T->chipMemo[T->chipMemoCount].K = st->hwK;
+    memcpy(T->chipMemo[T->chipMemoCount].w, w, (size_t)(st->hwK + 1) * sizeof *w);
+    T->chipMemoCount++;
+}
+
 static double voice_f0(const TaudEngine *e, const TaudVoice *voice)
 {
     int rate = voice->activeSamplingRate;
     double pr = voice->snapPlaybackRate ? voice->playbackRate : voice->currentPlaybackRate;
+    /* A chip source sounds what the chip makes of the rate, and the chip reads
+     * every rate against the tracker convention's 8363. */
+    if (voice->formant != NULL && voice->formant->srcKind != CHIP_NONE) {
+        return (pr * e->rate * LINEAR_FREQ_C4_HZ) / OPL_C4_RATE;
+    }
     return rate > 0 ? (pr * e->rate * LINEAR_FREQ_C4_HZ) / rate : 0.0;
 }
 
@@ -1033,17 +1532,66 @@ static void seg_amps(const TaudFormantSegment *seg, double t, double *out)
     out[2] = track_at(&seg->af, t);
 }
 
-static void blend_into(const TaudConsonant *row, double w, double s, double *F, double *B,
-                       const double *NF, const double *NB)
+/* A velar's F2 and F3 meet as close as the order rule lets two formants
+ * come: F3 ÷ F2 = 1.15, about the geometric mean of the two it meets. */
+#define PINCH 1.0723805294763609
+/* A nasalised vowel's F1 rises this much at a man's size (Klatt 1980 §V.B). */
+#define NASAL_F1 100
+
+/* Configure the tract for this update (blendInto): the consonant's own
+ * tract blended with the next sound's by w. A secondary articulation `art`
+ * (palatal, dark) puts its tongue's F2 and F3 in the consonant's; otherwise a
+ * velar takes them from the sound it meets, drawn together about their
+ * geometric mean. */
+static void blend_into(const TaudEngine *e, const TaudConsonant *row, double w, double s, double *F, double *B,
+                       const double *NF, const double *NB, int art)
 {
+    double c2 = 0, c3 = 0;
     int n;
+    if (art != ART_NONE) {
+        const double *T = e->formantTables.artF[art];
+        c2 = T[1] * s; c3 = T[2] * s;
+    } else if (row->dorsal) {
+        double p = sqrt(NF[1] * NF[2]);
+        c2 = p / PINCH; c3 = p * PINCH;
+    }
     for (n = 0; n < 3; n++) {
-        double cf = row->F[n] > 0 ? row->F[n] * s : NF[n];
+        double cf = n == 1 && c2 > 0 ? c2 : n == 2 && c3 > 0 ? c3 : row->F[n] > 0 ? row->F[n] * s : NF[n];
         double cb = row->B[n] > 0 ? row->B[n] * s : NB[n];
         F[n] = NF[n] + w * (cf - NF[n]);
         B[n] = NB[n] + w * (cb - NB[n]);
     }
     F[3] = NF[3]; F[4] = NF[4]; B[3] = NB[3]; B[4] = NB[4];
+}
+
+/* How front the vowel a consonant meets is, 0 (back) … 1 (front): the vowel's
+ * tongue, or the glide's while it sounds (metFront). */
+static double met_front(const TaudFormantState *st)
+{
+    double x = st->vFront;
+    if (st->sv != 0) x += track_at(&st->svW, st->svT) * (SEMIVOWELS[st->sv].front - x);
+    return dmin(dmax(x / 255, 0), 1);
+}
+
+/* Where a consonant's nasal zero opens to, in a syllable with nasality beyond
+ * its nasal consonants (segZero). */
+static double seg_zero(const TaudConsonant *row, double w, double s, double met, double fnp, double ceil)
+{
+    double own;
+    if (!(row->fnz > 0)) return met;
+    own = dmin(row->fnz * s, ceil);
+    return met == fnp ? own : met + w * (own - met);
+}
+
+/* …the zero of the sound an onset consonant heads for: the first nasal of the
+ * consonants after it, or the vowel's (onsetMetZero). */
+static double onset_met_zero(const TaudFormantState *st, const TaudFormantSegment *seg, double s, double vz, double ceil)
+{
+    int n;
+    for (n = seg->next; n >= 0; n = st->onset[n].next) {
+        if (st->onset[n].row->fnz > 0) return dmin(st->onset[n].row->fnz * s, ceil);
+    }
+    return vz;
 }
 
 /* One control update (≈ 1 ms): the sequencer, the vowel, the coefficients. */
@@ -1052,23 +1600,36 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
     int upd = st->upd, n;
     double dt = (upd * 1000.0) / e->rate;
     const TaudFormantPatch *patch = st->patch;
-    double f0, ref, s, nzAmt = 0.0, ceil, fnp, fnz, nvEnd, inv;
+    double f0, ref, s, nzAmt = 0.0, ceil, fnp, fnz, vz, zf, nvEnd, inv;
     double *V = st->V, *VB = st->VB, *F = st->F, *B = st->B, *casc = st->casc;
     double ampNow[3], ampNext[3], nextF[5], nextB[5];
     const TaudFormantSegment *seg = NULL;
+    bool holding, sung, nasalV, nasality, steady;
     st->ctl = upd;
 
+    /* A fade before the coda has started takes the coda away for good. */
     if (voice->noteFading && st->phase != PHASE_CODA) st->codaVeto = true;
+    /* Walk past finished onset consonants into the vowel. A nucleus never
+     * finishes: it holds, a trill's time wrapping back by its cycle. */
     while (st->phase == PHASE_ONSET && st->t >= st->onset[st->seg].end) {
-        st->t -= st->onset[st->seg].end;
+        const TaudFormantSegment *cur = &st->onset[st->seg];
+        if (st->seg == st->nucleus) {
+            st->held = true;
+            if (cur->loop > 0) while (st->t >= cur->end) st->t -= cur->loop;
+            break;
+        }
+        st->t -= cur->end;
         st->seg++;
         if (st->seg >= st->onsetCount) { st->phase = PHASE_VOWEL; st->nOn = false; }
         else start_noise(e, st, &st->onset[st->seg]);
     }
-    if (st->phase == PHASE_VOWEL && voice->keyOff && !st->codaVeto && st->hasCoda) {
+    holding = st->phase == PHASE_ONSET && st->held;
+    if ((st->phase == PHASE_VOWEL || holding) && voice->keyOff && !st->codaVeto && st->hasCoda) {
         st->phase = PHASE_CODA;
         st->t = 0.0;
-        start_noise(e, st, &st->coda);
+        /* After a hissing nucleus the coda's own noise waits for the hiss to go. */
+        st->codaNoise = st->coda.noiseAt <= 0;
+        if (st->codaNoise) start_noise(e, st, &st->coda);
     }
     if (st->phase == PHASE_CODA && st->t >= st->coda.end) {
         st->phase = PHASE_DONE;
@@ -1076,6 +1637,10 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
         st->nOn = false;
         te_start_ramp_out(e, voice);
         return;
+    }
+    if (st->phase == PHASE_CODA && !st->codaNoise && st->t >= st->coda.noiseAt) {
+        st->codaNoise = true;
+        start_noise(e, st, &st->coda);
     }
 
     if (st->glideLeft > 0) {
@@ -1092,9 +1657,12 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
     } else if (!st->ownVowel) {
         st->vOpen = patch->open; st->vFront = patch->front; st->vRound = patch->round;
     }
+    /* A syllable with no vowel still has the tongue's rest — the vowel bytes —
+     * for what its consonants take from "the vowel's". */
+    sung = st->nucleus < 0;
     f0 = voice_f0(e, voice);
-    ref = note_hz(patch->refNote);
-    s = vowel_at_pitch(e, st->vFront, st->vOpen, st->vRound, f0, ref, patch->track, V, VB, patch->rhotic);
+    ref = note_hz(ref_note(patch));
+    s = vowel_at_pitch(e, st->vFront, st->vOpen, st->vRound, f0, ref, patch->track, V, VB, sung && patch->rhotic);
     if (st->sv != 0) {
         double gw = track_at(&st->svW, st->svT);
         if (gw > 0) {
@@ -1107,24 +1675,55 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
             }
         }
     }
+    ceil = 0.45 * e->rate;
+    fnp = dmin(FNP * s, ceil);
+    /* Nasalised, as Klatt makes it: F1 a hundred hertz higher (at a man's
+     * size), the order kept, and the nasal zero midway between that F1 and
+     * the nasal pole. */
+    nasalV = sung && patch->nasal;
+    vz = fnp;
+    if (nasalV) {
+        V[0] = dmin(V[0] + NASAL_F1 * s, ceil);
+        VB[0] = dmax(V[0] / 10, 50);
+        for (n = 1; n < 5; n++) if (V[n] < V[n - 1] * 1.15) V[n] = dmin(V[n - 1] * 1.15, ceil);
+        vz = (V[0] + fnp) / 2;
+    }
+    nasality = nasalV || (st->nucleus >= 0 && st->onset[st->nucleus].row->fnz > 0);
 
+    zf = fnp;
     if (st->phase == PHASE_ONSET) {
+        double w;
         seg = &st->onset[st->seg];
         if (seg->next >= 0) {
             const TaudFormantSegment *nx = &st->onset[seg->next];
-            blend_into(nx->row, nx->w.p[1], s, nextF, nextB, V, VB);
+            blend_into(e, nx->row, nx->w.p[1], s, nextF, nextB, V, VB, nx->art);
         } else {
             memcpy(nextF, V, sizeof nextF);
             memcpy(nextB, VB, sizeof nextB);
         }
-        blend_into(seg->row, track_at(&seg->w, st->t), s, F, B, nextF, nextB);
+        w = track_at(&seg->w, st->t);
+        blend_into(e, seg->row, w, s, F, B, nextF, nextB, seg->art);
         nzAmt = track_at(&seg->nz, st->t);
+        if (nasality) zf = seg_zero(seg->row, w, s, onset_met_zero(st, seg, s, vz, ceil), fnp, ceil);
         seg_amps(seg, st->t, ampNow);
         seg_amps(seg, st->t + dt, ampNext);
     } else if (st->phase == PHASE_CODA) {
+        double w;
+        const TaudFormantSegment *nuc = st->nucleus >= 0 ? &st->onset[st->nucleus] : NULL;
         seg = &st->coda;
-        blend_into(seg->row, track_at(&seg->w, st->t), s, F, B, V, VB);
+        w = track_at(&seg->w, st->t);
+        /* From the vowel — or, with none, from the nucleus as it held. */
+        if (nuc != NULL) {
+            blend_into(e, nuc->row, 1, s, nextF, nextB, V, VB, nuc->art);
+            blend_into(e, seg->row, w, s, F, B, nextF, nextB, seg->art);
+        } else {
+            blend_into(e, seg->row, w, s, F, B, V, VB, seg->art);
+        }
         nzAmt = track_at(&seg->nz, st->t);
+        if (nasality) {
+            double met = nuc != NULL ? (nuc->row->fnz > 0 ? dmin(nuc->row->fnz * s, ceil) : fnp) : vz;
+            zf = seg_zero(seg->row, w, s, met, fnp, ceil);
+        }
         seg_amps(seg, st->t, ampNow);
         seg_amps(seg, st->t + dt, ampNext);
     } else {
@@ -1133,36 +1732,47 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
         memcpy(B, VB, 5 * sizeof *B);
         ampNow[0] = gl ? track_at(&st->svAv, st->svT) : 1; ampNow[1] = 0; ampNow[2] = 0;
         ampNext[0] = gl ? track_at(&st->svAv, st->svT + dt) : 1; ampNext[1] = 0; ampNext[2] = 0;
+        if (nasalV) { nzAmt = 1; zf = vz; }
     }
-    ceil = 0.45 * e->rate;
-    fnp = dmin(FNP * s, ceil);
-    fnz = seg != NULL && seg->row->fnz > 0 ? dmin(seg->row->fnz * s, ceil) : fnp;
+    /* Without nasality the zero opens only to a nasal consonant's own. */
+    fnz = nasality ? zf : seg != NULL && seg->row->fnz > 0 ? dmin(seg->row->fnz * s, ceil) : fnp;
     set_res(e, casc, 0, fnp, BNP * s);
     set_res(e, casc, 3, fnp + nzAmt * (fnz - fnp), BNZ * s);
     for (n = 0; n < 5; n++) set_res(e, casc, 6 + (4 - n) * 3, dmin(F[n], ceil), dmin(B[n], ceil));
+    /* The parallel bank, while a consonant can be fricating — in a coda after
+     * a hissing nucleus, the nucleus's bank until the coda's own noise starts. */
     if (seg != NULL && st->nOn) {
-        double *bank = st->bank, *g = st->bankGain;
-        const double *a = seg->row->bank;
+        bool prev = st->phase == PHASE_CODA && !st->codaNoise;
+        const TaudConsonant *row = prev && seg->prevRow != NULL ? seg->prevRow : seg->row;
+        int art = prev ? seg->prevArt : seg->art;
+        double *bank = st->bank, *g = st->bankGain, back;
+        const double *a = row->bank;
         int j;
         set_peak_res(e, bank, 0, dmin(F[1], ceil), dmin(B[1], ceil));
         set_peak_res(e, bank, 3, dmin(F[2], ceil), dmin(B[2], ceil));
         for (j = 0; j < 3; j++) {
             set_peak_res(e, bank, 6 + j * 3, dmin(PAR_F[j] * s, ceil), dmin(PAR_B[j] * s, ceil));
         }
-        for (j = 0; j < 5; j++) {
+        /* A velar's bank follows the vowel it meets from front (the row's) to
+         * back (`bankBack`), its own tongue's when it has a secondary one. */
+        back = !row->hasBankBack ? 0 : art == ART_PALATAL ? 0 : art == ART_DARK ? 1 : 1 - met_front(st);
+        for (j = 0; j < 6; j++) {
             double gj = a[j] > 0 ? db_gain(a[j] - 60) : 0;
-            g[j] = (j & 1) == 0 ? gj : -gj;
+            if (row->hasBankBack) gj += back * ((row->bankBack[j] > 0 ? db_gain(row->bankBack[j] - 60) : 0) - gj);
+            g[j] = j == 5 || (j & 1) == 0 ? gj : -gj;
         }
-        g[5] = a[5] > 0 ? db_gain(a[5] - 60) : 0;
         st->nb = bank_norm(&e->formantTables, bank, g);
     }
 
-    if (st->fresh || st->normCount <= 0 || st->phase != PHASE_VOWEL) {
+    /* The normaliser: in a consonant at every update; in the vowel, and a
+     * nucleus holding, every NORM_EVERY updates. */
+    steady = st->phase == PHASE_VOWEL || (st->phase == PHASE_ONSET && st->held);
+    if (st->fresh || st->normCount <= 0 || !steady) {
         st->nvGoal = cascade_norm(e, casc, f0, st->hw, st->hwK);
         st->normCount = NORM_EVERY;
     }
     st->normCount--;
-    nvEnd = st->fresh || (st->phase != PHASE_VOWEL && st->nvGoal < st->nv)
+    nvEnd = st->fresh || (!steady && st->nvGoal < st->nv)
         ? st->nvGoal : st->nv + (st->nvGoal - st->nv) * 0.25;
     if (st->fresh) st->nv = nvEnd;
 
@@ -1187,13 +1797,35 @@ static double tract_res(const double *co, int i, double *cy, int j, double x)
     return y;
 }
 
-double te_render_formant_voice(TaudEngine *e, TaudVoice *voice, TaudInst *inst, int interpMode)
+/* A chip source's next sample (chipSource): the note's channel at output
+ * frame `frame`, at the voice's rate and at unity volume, keyed off with the
+ * voice. A channel that has rung out while the vowel — or a voiced nucleus,
+ * holding — still sings ramps the note out, as a sample's end does. */
+static double chip_source(TaudEngine *e, TaudVoice *voice, TaudFormantState *st, int64_t frame)
+{
+    double s;
+    bool alive, sustaining;
+    if (st->srcKind == CHIP_OPL) {
+        s = te_opl_render(e, &st->srcOpl, frame, voice->currentPlaybackRate, 1.0, voice->keyOff);
+    } else {
+        s = te_psg_render(e, &st->srcPsg, frame, voice->currentPlaybackRate, voice->keyOff);
+    }
+    sustaining = st->phase == PHASE_VOWEL || (st->phase == PHASE_ONSET && st->held && st->av > 0);
+    if (sustaining) {
+        alive = st->srcKind == CHIP_OPL ? te_opl_channel_alive(&st->srcOpl) : te_psg_channel_alive(&st->srcPsg);
+        if (!alive) te_start_ramp_out(e, voice);
+    }
+    return s;
+}
+
+double te_render_formant_voice(TaudEngine *e, TaudVoice *voice, TaudInst *inst, int interpMode, int64_t frame)
 {
     TaudFormantState *st = voice->formant;
     double g, n, x, out;
     double *casc = st->casc, *cy = st->cy;
     if (st->sgDue) { measure_source(e, voice, st); st->sgDue = false; }
-    g = te_fetch_tracker_sample(e, voice, inst, interpMode, 0);
+    g = st->srcKind != CHIP_NONE ? chip_source(e, voice, st, frame)
+                                 : te_fetch_tracker_sample(e, voice, inst, interpMode, 0);
     if (st->phase == PHASE_DONE) return 0.0;
     if (st->ctl <= 0) {
         formant_control(e, voice, st);

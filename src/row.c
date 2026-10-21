@@ -33,7 +33,12 @@ static void apply_instrument_change(TaudEngine *e, TaudVoice *v, const TaudInst 
                                     const TaudPatch *newPatch, bool reAttack, bool mayCarry)
 {
     int seedVol;
+    const TaudInst *formantChip;
     te_apply_active_sample(v, newInst, newPatch);
+    /* A formant instrument sung from a chip instrument takes the chip's C2SPD
+     * where its sample's rate would be, as on a trigger (trigger.c). */
+    formantChip = newInst->formant != NULL ? te_formant_chip_source(e, newInst) : NULL;
+    if (formantChip != NULL) v->activeSamplingRate = te_formant_chip_rate(formantChip);
     /* An OPL voice takes the new patch onto the channel it is sounding; on a
      * porta row the instrument byte re-attacks its envelopes without
      * restarting the phase (§5.5.2). A sampled note handed an OPL instrument
@@ -49,14 +54,29 @@ static void apply_instrument_change(TaudEngine *e, TaudVoice *v, const TaudInst 
     } else {
         v->opl = NULL;
     }
+    /* A PSG pair takes a new patch the same way, its internal status kept. */
+    if (newInst->psg != NULL && v->psg != NULL) {
+        v->psg->patch = newInst->psg;
+        v->psg->gen = -1;
+        if (reAttack) te_psg_reattack(v->psg);
+    } else if (newInst->psg != NULL) {
+        v->psg = &v->psgStore;
+        te_psg_state_init(v->psg);
+        te_psg_key_on(v->psg, newInst->psg, false);
+    } else {
+        v->psg = NULL;
+    }
     /* A formant voice keeps saying its syllable under the new record's tract;
-     * a sampled note handed one starts its tract at the vowel. */
+     * a sampled note handed one starts its tract at the vowel. Its source
+     * follows the record, a chip channel taking a new patch where it stands. */
     if (newInst->formant != NULL && v->formant != NULL) {
         te_formant_relatch(e, v->formant, newInst->formant);
+        te_formant_relatch_source(v->formant, formantChip);
     } else if (newInst->formant != NULL) {
         v->formant = &v->formantStore;
         te_formant_state_init(v->formant);
         te_formant_start_at_vowel(e, v->formant, newInst->formant);
+        te_formant_key_source(v->formant, formantChip);
     } else {
         v->formant = NULL;
     }

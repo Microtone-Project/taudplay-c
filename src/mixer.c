@@ -12,6 +12,17 @@ static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int i
                               double out[2], int n)
 {
     double s, c0, c1;
+    /* An FM rack (item 159) replaces the voice's own sample fetch. It is asked
+     * first because its operator 0 may itself be a chip channel (§5.5.1),
+     * which the rack reads — the voice it sounds on is the rack's. */
+    if (v->fmRig != NULL) {
+        s = te_render_fm_voice(e, v, interpMode, spt, e->oplFrame + n);
+        s = te_apply_voice_filter_self(v, s);
+        s = te_apply_taud_voice_fx(v, s, &v->bitcrusherCounter, &v->bitcrusherHeld);
+        out[0] = s;
+        out[1] = s;
+        return;
+    }
     /* An OPL channel (item 209) replaces the sample fetch, reading the chip
      * clock at this frame; it has applied the note volume itself. */
     if (v->opl != NULL) {
@@ -22,17 +33,21 @@ static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int i
         out[1] = s;
         return;
     }
-    /* A formant voice (item 212) plays its sample through the tract. */
-    if (v->formant != NULL) {
-        s = te_render_formant_voice(e, v, inst, interpMode);
+    /* A PSG pair (§7.9) on the same chip clock. Unlike OPL it leaves the note
+     * volume to the gain chain, as a sample does: its multiplying mix would
+     * otherwise square it. */
+    if (v->psg != NULL) {
+        s = te_render_psg_voice(e, v, e->oplFrame + n);
         s = te_apply_voice_filter_self(v, s);
         s = te_apply_taud_voice_fx(v, s, &v->bitcrusherCounter, &v->bitcrusherHeld);
         out[0] = s;
         out[1] = s;
         return;
     }
-    if (v->fmRig != NULL) {
-        s = te_render_fm_voice(e, v, interpMode, spt);
+    /* A formant voice (item 212) plays its sample — or the chip channel it is
+     * sourced from, on the same clock — through the tract. */
+    if (v->formant != NULL) {
+        s = te_render_formant_voice(e, v, inst, interpMode, e->oplFrame + n);
         s = te_apply_voice_filter_self(v, s);
         s = te_apply_taud_voice_fx(v, s, &v->bitcrusherCounter, &v->bitcrusherHeld);
         out[0] = s;
@@ -155,6 +170,13 @@ bool te_generate_tracker_audio(TaudEngine *e)
                 te_apply_tracker_tick(e);
             }
         }
+        /* PSG quarter ticks (§5.5.4): the tick pass ran the first; each later
+         * quarter runs at the first frame inside it, while a PSG pair sounds.
+         * (The JS cuts its spans there; one frame at a time is the same.) */
+        if (te_psg_live(e)) {
+            int q = te_psg_quarter_at(e->samplesIntoTick, spt);
+            while (e->psgQuarter < q) { e->psgQuarter++; te_psg_quarter_pass(e); }
+        }
 
         gvol = e->globalVolume / 255.0;
         mvol = e->mixingVolume / 255.0;
@@ -178,8 +200,11 @@ bool te_generate_tracker_audio(TaudEngine *e)
             te_advance_volume_ramp(e, voice, e->volDiv);
             te_advance_pitch_ramp(e, voice, spt);
             faderGain = (255 - voice->fader) / 255.0;
-            /* An OPL voice took its note volume into the operators. */
-            perVoiceGain = effEnvVol * voice->fadeoutVolume * (voice->opl != NULL ? 1.0 : voice->currentMixVolume) *
+            /* An OPL voice took its note volume into the operators — unless the
+             * chip is operator 0 of a rack, which reads it at unity and leaves
+             * the note's volume to the finished patch (§5.5.1). */
+            perVoiceGain = effEnvVol * voice->fadeoutVolume *
+                (voice->opl != NULL && voice->fmRig == NULL ? 1.0 : voice->currentMixVolume) *
                 swingScale * instGv * faderGain * voice->layerMixGain * voice->activeAttenGain;
             vol = perVoiceGain * globalGain;
             if (spatial == NULL) {
@@ -241,7 +266,8 @@ bool te_generate_tracker_audio(TaudEngine *e)
             te_advance_volume_ramp(e, bg, e->volDiv);
             te_advance_pitch_ramp(e, bg, spt);
             faderGain = (255 - bgFader) / 255.0;
-            vol = (effEnvVol * bg->fadeoutVolume * (bg->opl != NULL ? 1.0 : bg->currentMixVolume) *
+            vol = (effEnvVol * bg->fadeoutVolume *
+                   (bg->opl != NULL && bg->fmRig == NULL ? 1.0 : bg->currentMixVolume) *
                    swingScale * gvol * mvol * instGv * faderGain * bg->layerMixGain * bg->activeAttenGain *
                    e->masterVolume) / 255.0;
             if (spatial == NULL) {

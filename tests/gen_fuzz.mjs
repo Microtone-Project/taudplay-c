@@ -2,8 +2,10 @@
 // engine as it can reach: every effect column command, both cell formats,
 // 32 and 64 lanes, surround models, envelopes of every kind, IT and SF2
 // filters, NNA / duplicate checks (the lane check included), Ixmp patches
-// (stereo included), layered and FM metainstruments, OPL and formant
-// instruments, sample modifications, interrupts and mastering.
+// (stereo included), layered and FM metainstruments (chip operators
+// included), OPL, PSG and formant instruments (sung from a sample or from a
+// chip), table kinds the engine does not know, sample modifications,
+// interrupts and mastering.
 //
 //   node tests/gen_fuzz.mjs <microtone-taudplay> SEED OUT.taud
 //
@@ -168,21 +170,57 @@ for (let idx = 50; idx < 56; idx++) {
   oplInsts.push(idx);
 }
 
+// PSG instruments (type 9): two oscillators, every waveform, both mixes,
+// mutes, the chip envelope, tremolo/vibrato, X resets and the auto-advance.
+const psgInsts = [];
+for (let idx = 70; idx < 76; idx++) {
+  const b = rec(idx);
+  b.fill(0);
+  b.set([0x90, 0x00, 0xff, 0xff], 0);
+  typedFields(b, null);
+  const blk = b.subarray(197, 251);
+  blk[0] = (chance(0.5) ? 1 : 0) | (chance(0.15) ? 4 : 0) | (chance(0.15) ? 8 : 0) | (chance(0.1) ? ri(0, 255) & 0xf2 : 0);
+  blk[1] = chance(0.2) ? ri(0, 255) : 0;
+  for (let k = 0; k < 2; k++) {
+    const o = 2 + k * 12;
+    const wave = idx === 70 + k ? ri(1, 7) : ri(0, 15);
+    blk[o] = (wave << 4) | ri(1, 15);
+    blk[o + 1] = (ri(0, 15) << 4) | ri(0, 15);
+    blk[o + 2] = (ri(1, 15) << 4) | ri(0, 15);
+    blk[o + 3] = (ri(0, 3) << 6) | (chance(0.6) ? ri(0, 20) : ri(0, 63));
+    blk[o + 4] = ri(0, 255);
+    blk[o + 5] = chance(0.4) ? 0 : pick([1, 2, 4, 8, ri(1, 255)]);
+    blk[o + 6] = ri(0, 3) | (chance(0.1) ? ri(0, 255) & 0xfc : 0);
+    if (chance(0.1)) for (let j = 7; j < 12; j++) blk[o + j] = ri(0, 255);
+  }
+  psgInsts.push(idx);
+}
+
 // Formant instruments (type 1): a source, a vowel, consonant slots, a glide.
 const CONS_IDS = [0, 0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 13, 14, 15, 16, 32, 34, 37, 40, 41, 44, 45, 48, 49, 50, 51,
   52, 54, 55, 56, 58, 60, 62, 64, 66, 67, 68, 69, 70, 72, 74, 80, 81, 83, 85, 86, 88, 90, 96, 98, 100, 104, 105, 200];
 const formantInsts = [];
-for (let idx = 60; idx < 65; idx++) {
+for (let idx = 60; idx < 68; idx++) {
   const b = rec(idx);
   b.fill(0);
   b.set([0x10, 0x00, 0xff, 0xff], 0);
+  // The source instrument (bits 8…9 in byte 0, 0…7 in byte 1): a chip one
+  // sings from it; anything else (itself, a sample, a formant) is ignored.
+  if (idx >= 64 || chance(0.25)) {
+    const src = idx >= 66 ? pick(psgInsts) : idx >= 64 ? pick(oplInsts)
+      : pick([...oplInsts, ...psgInsts, idx, 1, 61, 999]);
+    b[0] |= (src >>> 8) & 3;
+    b[1] = src & 0xff;
+  }
   const s = samples[pick([0, 1, 2, 5, ri(0, samples.length - 1)])];
   typedFields(b, s);
   const blk = b.subarray(197, 251);
   blk[0] = s.ptr & 0xff; blk[1] = (s.ptr >>> 8) & 0xff; blk[2] = (s.ptr >>> 16) & 0xff;
   blk[3] = ri(0, 255); blk[4] = ri(0, 255); blk[5] = ri(0, 255);
   blk[6] = pick([0, 64, ri(0, 255)]);
-  w16(blk, 7, pick([0x4000, 0x5000, ri(0x3000, 0x7000)]));
+  // The reference note (0 = no vowel: a syllabic consonant) and bit 15, a
+  // nasalised vowel.
+  w16(blk, 7, pick([0x4000, 0x5000, ri(0x3000, 0x7000), 0, 0]) | (chance(0.3) ? 0x8000 : 0));
   blk[9] = pick([0, 20, ri(0, 255)]);
   blk[10] = pick([128, ri(64, 192), ri(0, 255)]);
   const lo = pick([s.ptr, 16]);
@@ -200,7 +238,11 @@ for (let idx = 60; idx < 65; idx++) {
     blk[o + 10] = chance(0.5) ? 0 : ri(0, 255);
     blk[o + 11] = chance(0.5) ? 0 : ri(0, 255);
   }
-  blk[53] = (chance(0.5) ? ri(0, 7) : 0) | (chance(0.3) ? 0x80 : 0);
+  // CCGVRC's G (bits 0–2), the onset's secondary articulation (3–4), the
+  // coda's release (5–6) and R (bit 7).
+  blk[53] = (chance(0.5) ? ri(0, 7) : 0) | (ri(0, 3) << 3) | (ri(0, 3) << 5) | (chance(0.3) ? 0x80 : 0);
+  // Now and then nothing to say at all: no vowel and no consonant.
+  if (chance(0.08)) { w16(blk, 7, 0); blk[17] = 0; blk[29] = 0; blk[41] = 0; }
   formantInsts.push(idx);
 }
 
@@ -231,7 +273,7 @@ for (let idx = 30; idx < 34; idx++) {
   const layers = [];
   for (let k = 0; k < nL; k++) {
     const ps = chance(0.7) ? 0 : ri(0, 0x8000);
-    layers.push({ inst: chance(0.8) ? pick(sampleInsts) : pick([...oplInsts, ...formantInsts]), mix: ri(100, 200), detune: ri(-2000, 2000),
+    layers.push({ inst: chance(0.75) ? pick(sampleInsts) : pick([...oplInsts, ...psgInsts, ...formantInsts]), mix: ri(100, 200), detune: ri(-2000, 2000),
       ps, pe: chance(0.7) ? 0xffff : ri(ps, 0xffff), vs: 0, ve: chance(0.8) ? 63 : ri(0, 63),
       fixed: chance(0.2) });
   }
@@ -243,7 +285,9 @@ for (let idx = 40; idx < 43; idx++) {
   const nOps = ri(2, 4);
   const ops = [];
   for (let k = 0; k < nOps; k++) {
-    ops.push({ inst: chance(0.9) ? pick(sampleInsts.slice(0, 6)) : pick([...oplInsts, ...formantInsts]), mix: ri(120, 200), detune: ri(-300, 3000),
+    // Chip operators (OPL, PSG) are read with phase modulation; a formant
+    // instrument is a high meta and is refused.
+    ops.push({ inst: chance(0.7) ? pick(sampleInsts.slice(0, 6)) : pick([...oplInsts, ...psgInsts, ...formantInsts]), mix: ri(120, 200), detune: ri(-300, 3000),
       ps: 0, pe: 0xffff, vs: 0, ve: 63, fixed: false });
   }
   const progs = [
@@ -254,6 +298,12 @@ for (let idx = 40; idx < 43; idx++) {
     [nOps - 1, 0xff02, 0x0400 | 0],
   ];
   metaRecord(idx, 4, ops, pick(progs).map((w) => (w & 0xff00) === 0xff00 ? w : (w & ~0x3ff) | Math.min(w & 0x3ff, nOps - 1)), false);
+}
+// Tables of kinds the engine has no reading for (types 2, 3, 5, 7, 10…15):
+// the Layered shape, sounding nothing.
+for (let idx = 34; idx < 36; idx++) {
+  metaRecord(idx, pick([2, 3, 5, 7, 10, 11, 12, 13, 14, 15]),
+    [{ inst: pick(sampleInsts), mix: 160, detune: 0, ps: 0, pe: 0xffff, vs: 0, ve: 63, fixed: false }], null, false);
 }
 
 // ── Ixmp patches ──
@@ -275,7 +325,7 @@ function patchRecord(p) {
   return bytes;
 }
 const ixmp = [];
-for (const idx of [...sampleInsts.slice(0, 10), oplInsts[0], formantInsts[0]]) {
+for (const idx of [...sampleInsts.slice(0, 10), oplInsts[0], psgInsts[0], formantInsts[0]]) {
   if (!chance(0.6)) continue;
   const n = ri(1, 3);
   const bytes = [];
@@ -312,7 +362,12 @@ const EFFECTS = [
   [0x18, () => ri(0, 0x2000)], [0x19, () => ri(0, 255) << 8],
   [0x1a, () => ri(0, 255) << 8], [0x1b, () => ri(0, 0xffff)],
   [0x1c, () => {
-    const sub = pick([0, 1, 2, 3, 4, 5, 6, 7, 7, 8, 0xa, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf]);
+    const sub = pick([0, 1, 2, 3, 4, 5, 6, 7, 7, 8, 0xa, 0xa, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf]);
+    // S $A on a PSG voice: an auto-advance, a level, the mutes.
+    if (sub === 0xa && chance(0.5)) {
+      return pick([0xa000 | ri(0, 0xff), 0xa100 | ri(0, 0x3f), 0xa800 | ri(0, 0xff), 0xa900 | ri(0, 0x3f),
+        0xaf00 | ri(0, 3), 0xaf00 | ri(0, 0xff), 0xa200 | ri(0, 0xff)]);
+    }
     if (sub === 0xd) return 0xd000 | (ri(0, 5) << 8) | (ri(0, 4) << 4) | ri(0, 4);
     if (sub === 0xb) return 0xb000 | (ri(0, 2) << 8);
     if (sub === 0xe) return 0xe000 | (ri(0, 2) << 8);
@@ -335,20 +390,24 @@ function randNote() {
   if (r < 0.10) return ri(0x10, 0x1f);
   return ri(0x3000, 0x7000);
 }
-// FUZZ_WILD=1 overwrites every OPL and formant block with random bytes (for
-// the sanitizer build: pointers, lengths and rates anywhere at all).
+// FUZZ_WILD=1 overwrites every OPL, PSG and formant block with random bytes
+// (for the sanitizer build: pointers, lengths and rates anywhere at all).
 if (process.env.FUZZ_WILD) {
-  for (const idx of [...oplInsts, ...formantInsts]) {
+  for (const idx of [...oplInsts, ...psgInsts, ...formantInsts]) {
     const blk = rec(idx).subarray(197, 251);
     for (let k = 0; k < blk.length; k++) blk[k] = ri(0, 255);
     if (formantInsts.includes(idx)) for (let k = 4; k < 15; k++) rec(idx)[k] = ri(0, 255);
   }
 }
 
-// FUZZ_INSTS=opl|formant narrows the patterns to one kind, to isolate a failure.
+// FUZZ_INSTS=opl|psg|formant|fm narrows the patterns to one kind, to isolate
+// a failure.
 const instChoices = process.env.FUZZ_INSTS === "opl" ? oplInsts
+  : process.env.FUZZ_INSTS === "psg" ? psgInsts
   : process.env.FUZZ_INSTS === "formant" ? formantInsts
-  : [...sampleInsts, 30, 31, 32, 33, 40, 41, 42, ...oplInsts, ...oplInsts, ...formantInsts, ...formantInsts];
+  : process.env.FUZZ_INSTS === "fm" ? [40, 41, 42]
+  : [...sampleInsts, 30, 31, 32, 33, 34, 35, 40, 41, 42, ...oplInsts, ...oplInsts, ...psgInsts, ...psgInsts,
+    ...formantInsts, ...formantInsts];
 function makePattern() {
   const p = new Uint8Array(ROWS * cellBytes);
   for (let r = 0; r < ROWS; r++) {

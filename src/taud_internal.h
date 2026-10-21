@@ -140,10 +140,12 @@ static inline double dmin(double a, double b) { return a < b ? a : b; }
 static inline double dmax(double a, double b) { return a > b ? a : b; }
 
 /* JavaScript's transcendental functions (jsmath.c): fdlibm, exactly as V8
- * computes them, whatever the platform's libm — `pow` included: V8's is its
- * own fdlibm port (base/ieee754.cc, with one grouping of its own), not the C
- * library's. TAUD_LIBM_POW swaps in the platform pow (closer to correctly
- * rounded, no longer bit-exact against the JS). */
+ * computes them, whatever the platform's libm — `pow` included: V8's own
+ * fdlibm port (base/ieee754.cc, with one grouping of its own). Current V8
+ * calls the platform's std::pow instead unless run with
+ * --no-use-std-math-pow, which the tests pass; TAUD_LIBM_POW swaps in the
+ * platform pow to match such a V8 on the same machine (no longer
+ * platform-independent). */
 double js_sin(double x);
 double js_cos(double x);
 double js_tan(double x);
@@ -233,6 +235,16 @@ typedef struct {
 #define OPL_BLOCK_START 197
 #define OPL_BLOCK_LEN 54
 #define OPL_C4_RATE 8363
+/* The chip's sample rate, 3579545 / 72 Hz (OPL_RATE). */
+#define OPL_RATE_HZ (3579545.0 / 72)
+
+/* The envelope generator's states, shared with the PSG (oplAdvanceEnvelope). */
+#define EG_OFF 0
+#define EG_ATTACK 1
+#define EG_DECAY 2
+#define EG_SUSTAIN 3
+#define EG_RELEASE 4
+#define OPL_ENV_MAX 511
 
 typedef struct {
     int am, vib, eg, ksr, mult, ksl, tl, ar, dr, sl, rr, ws;
@@ -266,7 +278,60 @@ typedef struct {
     double cur, last;
     double vol;
     int volAtt;
+    /* Phase modulation from outside the chip, in 1/1024 of a cycle, added to
+     * every OUTPUT operator's phase: what an FM rack reading this channel as
+     * an operator writes (§5.5.1). 0 on every other path. */
+    double pm;
 } TaudOplState;
+
+/* ── PSG instruments, Metainstrument type 9 (psg.js) ───────────────────── */
+
+#define META_TYPE_PSG 9
+#define PSG_BLOCK_START 197
+#define PSG_BLOCK_LEN 54
+#define PSG_NOISE_LONG_LEN 32767
+#define PSG_NOISE_MID_LEN 2047
+#define PSG_NOISE_SHORT_LEN 127
+
+/* One oscillator's twelve bytes, unpacked (PsgOscillator). The envelope's
+ * fields sit in an operator, so the chip's envelope generator reads them
+ * unchanged: ar dr sl rr eg, plus mult ksl tl ksr. */
+typedef struct {
+    TaudOplOperator op;
+    int wave;
+    bool reset, invert;
+    int tremolo, vibrato;       /* 0 off, 1 shallow, 2 deep */
+    int advance, pattern;
+} TaudPsgOscillator;
+
+/* A decoded type-9 patch (PsgPatch), with the S $Axxx run-time overlay: each
+ * field -1 while the record's own value stands. */
+typedef struct {
+    int gen;
+    bool multiply, muteA, muteB;
+    TaudPsgOscillator osc[2];
+    int rtAdvance[2], rtLevel[2], rtMute;
+    int rtGen;
+} TaudPsgPatch;
+
+/* One sounding PSG pair (PsgState), hung off a voice. */
+typedef struct {
+    TaudPsgPatch *patch;
+    int gen;
+    double rate;
+    uint8_t state[2];
+    int32_t env[2], ksrOffset[2], kslAtt[2];
+    double gain[2], inc[2];
+    double phase[2], noise[2];
+    uint8_t adv[2];
+    int32_t advCount[2];
+    double lfo[2];              /* set at every key-on; NaN = anchored at the next frame rendered */
+    bool keyed;
+    bool kValid;                /* false = the JS NaN */
+    int64_t k;
+    double cur, last;
+    double pm;                  /* a 32-bit phase offset from an FM rack */
+} TaudPsgState;
 
 /* ── formant instruments, Metainstrument type 1 (formant.js) ───────────── */
 
@@ -274,7 +339,7 @@ typedef struct {
 #define FORMANT_BLOCK_START 197
 #define FORMANT_BLOCK_LEN 54
 #define FORMANT_SLOTS 3
-#define FORMANT_TRACK_MAX 24    /* doubles: 12 (time, value) points; the longest track has 11 */
+#define FORMANT_TRACK_MAX 32    /* doubles: 16 (time, value) points; the longest track has 13 */
 #define NORM_HARMONICS 64
 
 typedef struct {
@@ -286,9 +351,14 @@ typedef struct {
 /* The decoded tract block (FormantPatch). */
 typedef struct {
     uint32_t srcPtr;
-    int front, open, round, track, refNote, glide, timing;
+    int srcInst;                /* the header's source instrument, 0 = the sample */
+    int front, open, round, track, glide, timing;
+    int refNote;                /* bits 0…14 of the word; 0 = the syllable has no vowel */
+    bool nasal;                 /* bit 15: the vowel nasalised */
     int semivowel;
     bool rhotic;
+    int secondary;              /* the onset's last consonant: ART_* */
+    int codaArt;                /* the coda: CODA_* */
     uint32_t rangeLo, rangeHi;
     TaudFormantSlot slots[FORMANT_SLOTS];
 } TaudFormantPatch;
@@ -308,7 +378,18 @@ typedef struct {
     double end;
     TaudFormantTrack w, av, ah, af, nz;
     int next;
+    int art;                    /* as blendInto reads it: ART_NONE, _PALATAL or _DARK */
+    double loop;                /* a held nucleus's repeat, ms (a trill's cycle) */
+    /* A coda after a hissing nucleus: its own noise starts this far in, the
+     * nucleus's going on until then through the nucleus's bank. */
+    double noiseAt;
+    const struct TaudConsonant *prevRow;
+    int prevArt;
 } TaudFormantSegment;
+
+#define CHIP_NONE 0
+#define CHIP_OPL 1
+#define CHIP_PSG 2
 
 typedef struct {
     const TaudFormantPatch *patch;
@@ -319,7 +400,16 @@ typedef struct {
     bool hasCoda;
     TaudFormantSegment coda;
     double t;
-    bool codaVeto, fresh;
+    bool codaVeto, codaNoise, fresh;
+    /* A syllable with no vowel: the onset index of its nucleus (-1 when there
+     * is a vowel), and whether it has come to hold. */
+    int nucleus;
+    bool held;
+    /* The glottal source when it is a chip channel (CHIP_*), keyed with the
+     * note; CHIP_NONE when the source is the record's sample. */
+    int srcKind;
+    TaudOplState srcOpl;
+    TaudPsgState srcPsg;
     int upd, ctl, normCount;
     bool ownVowel;
     int sv;                     /* SEMIVOWELS index, 0 = none */
@@ -378,6 +468,7 @@ typedef struct TaudInst {
 
     TaudMeta *meta;             /* NULL unless a metainstrument */
     TaudOplPatch *opl;          /* NULL unless a type-8 OPL instrument */
+    TaudPsgPatch *psg;          /* NULL unless a type-9 PSG instrument */
     TaudFormantPatch *formant;  /* NULL unless a type-1 formant instrument */
 
     /* Invert loop (S $F0xx). invertMaskLen 0 = no mask. */
@@ -431,7 +522,31 @@ static inline int inst_dup_check_action(const TaudInst *i)
 /* Duplicate Check Type 4 (item 216): every note arriving on the lane. */
 #define DCT_LANE 4
 static inline bool inst_is_opl(const TaudInst *i) { return i->opl != NULL; }
+static inline bool inst_is_psg(const TaudInst *i) { return i->psg != NULL; }
+/* A chip instrument (OPL or PSG): what a high meta can sound through (chipPatch). */
+static inline bool inst_is_chip(const TaudInst *i) { return i->opl != NULL || i->psg != NULL; }
 static inline bool inst_is_formant(const TaudInst *i) { return i->formant != NULL; }
+
+/* The metainstrument tiers (inst.js metaTier): types 0…7 are HIGH metas, made
+ * out of sources; 8…13 LOW metas, sound generators of their own; 14, 15
+ * reserved. An ordinary instrument has no tier. */
+#define META_TIER_NONE (-1)
+#define META_TIER_HIGH 0
+#define META_TIER_LOW 1
+#define META_TIER_RESERVED 2
+static inline int meta_tier_of(int type)
+{
+    int t = type & 0x0f;
+    return t <= 7 ? META_TIER_HIGH : t <= 13 ? META_TIER_LOW : META_TIER_RESERVED;
+}
+static inline int inst_meta_tier(const TaudInst *i)
+{
+    if (i->opl != NULL || i->psg != NULL) return META_TIER_LOW;
+    if (i->formant != NULL) return META_TIER_HIGH;
+    if (i->meta != NULL) return meta_tier_of(i->meta->type);
+    return META_TIER_NONE;
+}
+static inline bool inst_is_high_meta(const TaudInst *i) { return inst_meta_tier(i) == META_TIER_HIGH; }
 static inline bool inst_filter_sf_mode(const TaudInst *i) { return ((i->fadeoutHigh >> 4) & 1) != 0; }
 static inline int inst_default_azimuth(const TaudInst *i)
 {
@@ -541,6 +656,11 @@ struct TaudVoice {
     TaudOplState *opl;
     TaudOplState oplStore;
     bool oplCarry;
+    /* PSG pair (type 9): NULL or &psgStore, kept across notes as OPL's is —
+     * an oscillator's internal status lives here. */
+    TaudPsgState *psg;
+    TaudPsgState psgStore;
+    bool psgCarry;
     /* Formant tract (item 212): NULL or &formantStore. */
     TaudFormantState *formant;
     TaudFormantState formantStore;
@@ -788,6 +908,7 @@ void te_master_chain_process(TaudMasterChain *c, float *left, float *right, int 
 #define SOURCE_DFT_MAX 4096
 typedef struct {
     double logCard[4][4][2];
+    double artF[3][5];              /* ART_F: [ART_PALATAL], [ART_DARK] */
     double elwLogF[ISO226_N], elwDb[ISO226_N];
     int bankN;
     double bankW[BANK_GRID_MAX], bankC1[BANK_GRID_MAX], bankS1[BANK_GRID_MAX];
@@ -803,6 +924,18 @@ typedef struct {
         int K;
         double w[NORM_HARMONICS + 1];
     } memo[32];
+    /* measureChipSource's memo: a chip patch's measurement at a rate. Cleared
+     * whenever the instruments are uploaded, so a patch pointer is never
+     * reused for another patch while an entry names it. */
+    int chipMemoCount;
+    struct {
+        const void *patch;
+        int kind, gen, rtGen;
+        double pr, sm, sg;
+        int K;
+        double w[NORM_HARMONICS + 1];
+    } chipMemo[32];
+    double chipBuf[4096];               /* scratch */
 } TaudFormantTables;
 
 typedef struct TaudVoiceChunk {
@@ -845,6 +978,8 @@ typedef struct TaudEngine {
     double samplesIntoTick;
     bool firstRow;
     int64_t oplFrame;           /* the OPL chip clock: frames mixed since reset */
+    int psgQuarter;             /* the quarter of the tick the PSG auto-advance has reached */
+    bool hasPsg;                /* some instrument is a PSG one (else no voice can sound a pair) */
     TaudVoice voices[MAX_VOICES];
     int toneMode, interpolationMode;
     bool ledFilterOn;
@@ -891,6 +1026,10 @@ typedef struct TaudEngine {
     /* Tables. */
     double sincTable[SINC_TABLE_SIZE];
     TaudFormantTables formantTables;
+    /* The PSG noises: one period of each shift register's output. */
+    uint8_t psgNoiseLong[PSG_NOISE_LONG_LEN];
+    uint8_t psgNoiseMid[PSG_NOISE_MID_LEN];
+    uint8_t psgNoiseShort[PSG_NOISE_SHORT_LEN];
 
     bool oom;                   /* an allocation failed on the render path */
 } TaudEngine;
@@ -1074,16 +1213,45 @@ void te_fm_rig_init(TaudFmRig *rig, int count);
 void te_fm_rig_clone(TaudFmRig *dst, const TaudFmRig *src);
 void te_fm_referenced_operators(const uint16_t *program, int len, int count, uint8_t *used);
 void te_fm_seed_gains(TaudFmRig *rig, const TaudMeta *meta);
-double te_render_fm_voice(TaudEngine *e, TaudVoice *v, int interpMode, double spt);
+double te_render_fm_voice(TaudEngine *e, TaudVoice *v, int interpMode, double spt, int64_t frame);
 void te_drop_fm_operators(TaudEngine *e, int vi);
 
 /* opl.c */
+extern const int32_t OPL_MULTIPLE_X2[16];
+extern const int32_t OPL_SUSTAIN_LEVEL[16];
+#define OPL_VIBRATO_PERIOD 8192
+#define OPL_TREMOLO_PERIOD 13440
 void te_decode_opl_patch(const uint8_t *bytes, TaudOplPatch *into);
 void te_opl_state_init(TaudOplState *st);
 void te_opl_key_on(TaudOplState *st, const TaudOplPatch *patch, bool carry);
 void te_opl_key_off(TaudOplState *st);
 void te_opl_reattack(TaudOplState *st);
+double te_opl_render(const TaudEngine *e, TaudOplState *st, int64_t frame, double rate, double vol, bool keyOff);
+bool te_opl_channel_alive(const TaudOplState *st);
 double te_render_opl_voice(TaudEngine *e, TaudVoice *v, int64_t frame);
+/* What the PSG borrows from the chip (psg.js imports them from opl.js). */
+int te_opl_expand(double att);
+void te_opl_advance_envelope(uint8_t *state, int32_t *env, int32_t ksrOffset, const TaudOplOperator *op, int32_t eg);
+void te_opl_key_scaling(double hz, int ksr, int ksl, int32_t out[2]);
+int64_t te_opl_chip_index(const TaudEngine *e, int64_t frame, double *frac);
+double te_opl_tremolo_at(int deep, int p);
+double te_opl_vibrato_at(int deep, int p);
+
+/* psg.c */
+void te_psg_tables_init(TaudEngine *e);
+void te_decode_psg_patch(const uint8_t *bytes, TaudPsgPatch *into);
+void te_psg_clear_runtime(TaudPsgPatch *patch);
+bool te_psg_write_register(TaudPsgPatch *patch, int reg);
+void te_psg_state_init(TaudPsgState *st);
+void te_psg_key_on(TaudPsgState *st, TaudPsgPatch *patch, bool carry);
+void te_psg_key_off(TaudPsgState *st);
+void te_psg_reattack(TaudPsgState *st);
+int te_psg_current_wave(const TaudPsgState *st, int i);
+void te_psg_quarter_tick(TaudPsgState *st);
+int te_psg_quarter_at(double into, double spt);
+double te_psg_render(const TaudEngine *e, TaudPsgState *st, int64_t frame, double rate, bool keyOff);
+bool te_psg_channel_alive(const TaudPsgState *st);
+double te_render_psg_voice(TaudEngine *e, TaudVoice *v, int64_t frame);
 
 /* formant.c */
 #define PHASE_ONSET 0
@@ -1098,7 +1266,11 @@ void te_formant_restart(TaudEngine *e, TaudFormantState *st);
 void te_formant_relatch(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch);
 void te_formant_start_at_vowel(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch);
 void te_formant_set_vowel(TaudFormantState *st, int f, int g, int r);
-double te_render_formant_voice(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode);
+const TaudInst *te_formant_chip_source(const TaudEngine *e, const TaudInst *inst);
+int te_formant_chip_rate(const TaudInst *src);
+void te_formant_key_source(TaudFormantState *st, const TaudInst *chip);
+void te_formant_relatch_source(TaudFormantState *st, const TaudInst *chip);
+double te_render_formant_voice(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode, int64_t frame);
 
 /* spatial.c */
 double te_wrap_azimuth(double a);
@@ -1160,6 +1332,8 @@ void te_reconstruct_ditto_state(TaudEngine *e, int startRow);
 
 /* tick.c */
 void te_apply_tracker_tick(TaudEngine *e);
+void te_psg_quarter_pass(TaudEngine *e);
+bool te_psg_live(const TaudEngine *e);
 void te_advance_sample_mod_extended(TaudEngine *e, TaudVoice *v, double spt);
 int te_funk_walk_step(int funkMode, int walk, int loopStart, int loopLen, int sampleLen);
 int te_funk_walk_pointer(TaudEngine *e, int funkMode, int walk, int loopStart, int loopLen, int sampleLen);

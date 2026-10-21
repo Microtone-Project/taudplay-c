@@ -21,7 +21,7 @@
 
 #define OPL_CLOCK_HZ 3579545
 #define OPL_CLOCKS_PER_SAMPLE 72
-static const double OPL_RATE = (double)OPL_CLOCK_HZ / OPL_CLOCKS_PER_SAMPLE;
+static const double OPL_RATE = OPL_RATE_HZ;
 
 #define OPL_B_KIND 0
 #define OPL_B_C0A 1
@@ -83,7 +83,7 @@ static const uint16_t EXP_TABLE[256] = {
 };
 
 /* Total attenuation (1/256-log2 units, possibly fractional) to amplitude. */
-static int opl_expand(double att)
+int te_opl_expand(double att)
 {
     int32_t a;
     if (att >= 0x1800) return 0;
@@ -94,20 +94,14 @@ static int opl_expand(double att)
 #define OPL_RHYTHM_MIX 2
 #define OUTPUT_SCALE (1.0 / 4096)
 
-#define EG_OFF 0
-#define EG_ATTACK 1
-#define EG_DECAY 2
-#define EG_SUSTAIN 3
-#define EG_RELEASE 4
-#define OPL_ENV_MAX 511
 #define ENV_TO_LOG 8
 #define TL_TO_LOG 32
 #define SILENCE 0x1000
 
 static const int32_t KSL_ROM[16] = { 0, 24, 32, 37, 40, 43, 45, 47, 48, 50, 51, 52, 53, 54, 55, 56 };
 static const int32_t KSL_SHIFT[4] = { -1, 1, 2, 0 };
-static const int32_t OPL_MULTIPLE_X2[16] = { 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 20, 24, 24, 30, 30 };
-static const int32_t SUSTAIN_LEVEL[16] = { 0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 496 };
+const int32_t OPL_MULTIPLE_X2[16] = { 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 20, 24, 24, 30, 30 };
+const int32_t OPL_SUSTAIN_LEVEL[16] = { 0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 496 };
 static const int32_t EG_DUTY[4][8] = {
     { 1, 0, 1, 0, 1, 0, 1, 0 },
     { 1, 0, 1, 0, 1, 0, 1, 1 },
@@ -117,8 +111,8 @@ static const int32_t EG_DUTY[4][8] = {
 
 /* ── LFOs: free-running triangles of the chip clock ── */
 
-#define VIBRATO_PERIOD 8192
-#define TREMOLO_PERIOD 13440
+#define VIBRATO_PERIOD OPL_VIBRATO_PERIOD
+#define TREMOLO_PERIOD OPL_TREMOLO_PERIOD
 
 static double triangle(int p, int period)
 {
@@ -126,14 +120,15 @@ static double triangle(int p, int period)
     return p < half ? (double)p / half : 2 - (double)p / half;
 }
 
-/* TREMOLO_TABLE[depth][p]: Math.round(1/0.1875) = 5, Math.round(4.8/0.1875) = 26. */
-static double tremolo_at(int deep, int p)
+/* TREMOLO_TABLE[depth][p]: Math.round(1/0.1875) = 5, Math.round(4.8/0.1875) = 26.
+ * The PSG's oscillators read both tables too (OPL_TREMOLO_TABLE). */
+double te_opl_tremolo_at(int deep, int p)
 {
     return (deep ? 26 : 5) * ENV_TO_LOG * triangle(p, TREMOLO_PERIOD);
 }
 
 /* VIBRATO_TABLE[depth][p]. */
-static double vibrato_at(int deep, int p)
+double te_opl_vibrato_at(int deep, int p)
 {
     double cents = (deep ? 14 : 7) * (2 * triangle(p, VIBRATO_PERIOD) - 1);
     return cents == 0 ? 1 : js_pow(2, cents / 1200);
@@ -189,11 +184,15 @@ static int waveform(int shape, int phase, int *sign)
 
 /* ── the patch ── */
 
+/* Which operators reach the output. Four operators: operator 4 always,
+ * operator 1 when CNT A is set, and the other pair's last operator when CNT B
+ * is — operator 2 when CNT A is clear, operator 3 when it is set (the YMF262
+ * data sheet's four connection figures, catalogue 4MF262A6, p. 13). */
 static int opl_output_mask(int kind, int cntA, int cntB)
 {
     switch (kind) {
     case OPL_KIND_2OP: case OPL_KIND_BD: return cntA ? 3 : 2;
-    case OPL_KIND_4OP: return 8 | (cntA ? 1 : 0) | (cntB ? 4 : 0);
+    case OPL_KIND_4OP: return 8 | (cntA ? 1 : 0) | (cntB ? (cntA ? 4 : 2) : 0);
     case OPL_KIND_SD: case OPL_KIND_TOM: case OPL_KIND_TC: case OPL_KIND_HH: return 1;
     default: return 0;
     }
@@ -222,7 +221,7 @@ void te_decode_opl_patch(const uint8_t *bytes, TaudOplPatch *into)
         op->ksr = (r20 >> 4) & 1; op->mult = r20 & 0x0f;
         op->ksl = (r40 >> 6) & 3; op->tl = r40 & 0x3f;
         op->ar = (r60 >> 4) & 0x0f; op->dr = r60 & 0x0f;
-        op->sl = SUSTAIN_LEVEL[(r80 >> 4) & 0x0f]; op->rr = r80 & 0x0f;
+        op->sl = OPL_SUSTAIN_LEVEL[(r80 >> 4) & 0x0f]; op->rr = r80 & 0x0f;
         op->ws = rE0 & 7;
     }
     into->outputs = opl_output_mask(into->kind, into->cntA, into->cntB);
@@ -245,7 +244,7 @@ static int opl_block_fnum(double hz, bool lowFnum)
 
 /* The chip-sample index output frame `frame` falls on, and the fraction past
  * it, in the JS's double arithmetic (num/den exactly while num < 2^53). */
-static int64_t chip_index(const TaudEngine *e, int64_t frame, double *frac)
+int64_t te_opl_chip_index(const TaudEngine *e, int64_t frame, double *frac)
 {
     double num = (double)frame * OPL_CLOCK_HZ;
     double den = (double)OPL_CLOCKS_PER_SAMPLE * e->rate;
@@ -275,6 +274,24 @@ void te_opl_state_init(TaudOplState *st)
     st->kValid = true;          /* the constructor's k is -1, not NaN */
     st->k = -1;
     st->vol = -1;
+}
+
+/* The key scaling an operator at `hz` takes, as retune() works it out for a
+ * melodic channel (NTS 0, the ordinary F-number ceiling): out[0] the rate
+ * offset KSR adds to every envelope rate, out[1] the key-scale level in
+ * envelope units — for the PSG, which borrows the chip's envelope
+ * (oplKeyScaling). */
+void te_opl_key_scaling(double hz, int ksr, int ksl, int32_t out[2])
+{
+    int bf = opl_block_fnum(hz, false);
+    int block = bf >> 10, fnum = bf & 1023;
+    int ksv = (block << 1) | ((fnum >> 9) & 1);
+    int kslBase = KSL_ROM[(fnum >> 6) & 15] - 8 * (7 - block);
+    int shift;
+    if (kslBase < 0) kslBase = 0;
+    out[0] = ksr ? ksv : ksv >> 2;
+    shift = KSL_SHIFT[ksl & 3];
+    out[1] = shift < 0 ? 0 : (kslBase << 2) >> shift;
 }
 
 void te_opl_key_on(TaudOplState *st, const TaudOplPatch *patch, bool carry)
@@ -351,18 +368,19 @@ static void retune(const TaudEngine *e, TaudOplState *st, double rate)
     st->gen = patch->gen;
 }
 
-/* One envelope tick for operator i; `eg` is the chip clock as the JS's
- * int32 bit operations see it. */
-static void advance_envelope(TaudOplState *st, int i, const TaudOplOperator *op, int32_t eg)
+/* One envelope tick for one operator (oplAdvanceEnvelope): `state` and `env`
+ * point at its entries, `eg` is the chip clock as the JS's int32 bit
+ * operations see it. The PSG's oscillators run on it too. */
+void te_opl_advance_envelope(uint8_t *stp, int32_t *envp, int32_t ksrOffset, const TaudOplOperator *op, int32_t eg)
 {
-    int state = st->state[i], rateParam, rate, shift, steps, n;
+    int state = *stp, rateParam, rate, shift, steps, n;
     if (state == EG_OFF) return;
     rateParam = state == EG_ATTACK ? op->ar
         : state == EG_DECAY ? op->dr
         : state == EG_SUSTAIN ? (op->eg ? 0 : op->rr)
         : op->rr;
     if (rateParam == 0) return;
-    rate = rateParam * 4 + st->ksrOffset[i];
+    rate = rateParam * 4 + ksrOffset;
     if (rate > 60) rate = 60;
     shift = 12 - (rate >> 2);
     if (shift >= 0) {
@@ -372,27 +390,35 @@ static void advance_envelope(TaudOplState *st, int i, const TaudOplOperator *op,
         steps = EG_DUTY[rate & 3][eg & 7] << -shift;
     }
     for (n = 0; n < steps; n++) {
-        int32_t env = st->env[i];
-        switch (st->state[i]) {
+        int32_t env = *envp;
+        switch (*stp) {
         case EG_ATTACK:
             env -= (env >> 3) + 1;
-            if (env <= 0) { env = 0; st->state[i] = EG_DECAY; }
+            if (env <= 0) { env = 0; *stp = EG_DECAY; }
             break;
         case EG_DECAY:
             env += 1;
-            if (env >= op->sl) { env = op->sl; st->state[i] = EG_SUSTAIN; }
+            if (env >= op->sl) { env = op->sl; *stp = EG_SUSTAIN; }
             break;
         default:
             env += 1;
-            if (env >= OPL_ENV_MAX) { env = OPL_ENV_MAX; st->state[i] = EG_OFF; }
+            if (env >= OPL_ENV_MAX) { env = OPL_ENV_MAX; *stp = EG_OFF; }
             break;
         }
-        st->env[i] = env < 0 ? 0 : env > OPL_ENV_MAX ? OPL_ENV_MAX : env;
-        if (st->state[i] != state) break;
+        *envp = env < 0 ? 0 : env > OPL_ENV_MAX ? OPL_ENV_MAX : env;
+        if (*stp != state) break;
     }
 }
 
-static int operate(TaudOplState *st, int i, const TaudOplOperator *op, int mod, double extra, double vibrato)
+static void advance_envelope(TaudOplState *st, int i, const TaudOplOperator *op, int32_t eg)
+{
+    te_opl_advance_envelope(&st->state[i], &st->env[i], st->ksrOffset[i], op, eg);
+}
+
+/* `mod` is the phase modulation in phase steps: an integer, but a double,
+ * since an FM rack's offset (st->pm) can carry it anywhere (`& 0x3ff` of the
+ * JS's ToInt32 of the sum). */
+static int operate(TaudOplState *st, int i, const TaudOplOperator *op, double mod, double extra, double vibrato)
 {
     double att = (double)((st->env[i] + st->kslAtt[i]) * ENV_TO_LOG + op->tl * TL_TO_LOG) + extra;
     int32_t inc = st->inc[i];
@@ -401,9 +427,9 @@ static int operate(TaudOplState *st, int i, const TaudOplOperator *op, int mod, 
     st->phase[i] = st->phase[i] + (uint32_t)inc;
     st->prev[i] = st->out[i];
     if (st->state[i] == EG_OFF) { st->out[i] = 0; return 0; }
-    logv = waveform(op->ws, ((int32_t)(st->phase[i] >> 10) + mod) & 0x3ff, &sign);
+    logv = waveform(op->ws, js_toint32((double)(st->phase[i] >> 10) + mod) & 0x3ff, &sign);
     if (logv == SILENCE) { st->out[i] = 0; return 0; }
-    v = opl_expand(logv + att) * sign;
+    v = te_opl_expand(logv + att) * sign;
     st->out[i] = v;
     return v;
 }
@@ -417,7 +443,7 @@ static int rhythm_operator(TaudOplState *st, int i, const TaudOplOperator *op, i
     logv = waveform(op->ws, phase, &sign);
     if (logv == SILENCE) { st->out[i] = 0; return 0; }
     att = (double)((st->env[i] + st->kslAtt[i]) * ENV_TO_LOG + op->tl * TL_TO_LOG) + extra;
-    v = opl_expand(att + logv) * sign;
+    v = te_opl_expand(att + logv) * sign;
     st->out[i] = v;
     return v;
 }
@@ -428,21 +454,27 @@ static int feedback_of(const TaudOplState *st, int fb)
     return js_toint32((double)(st->out[0] + st->prev[0]) / 2 / (1 << (8 - fb)));
 }
 
-/* The chip's next sample for this channel at chip clock k (oplChipStep). */
+/* The chip's next sample for this channel at chip clock k (oplChipStep). The
+ * four four-operator connections are the YMF262 data sheet's (catalogue
+ * 4MF262A6, p. 13): CNT A 0, CNT B 1 is OP1 -> OP2 plus OP3 -> OP4. */
 static int opl_chip_step(TaudOplState *st, int64_t k)
 {
     const TaudOplPatch *patch = st->patch;
     const TaudOplOperator *ops = patch->ops;
     int32_t eg = (int32_t)(uint32_t)k;
-    double trem = tremolo_at(patch->deepTremolo, (int)(k % TREMOLO_PERIOD));
+    double trem = te_opl_tremolo_at(patch->deepTremolo, (int)(k % TREMOLO_PERIOD));
     /* The JS reads its vibrato table every sample; only an operator with its
      * VIB bit set uses the value, so it is evaluated only for one. */
     double vibrato = 1;
     int outputs = patch->outputs;
     double va = st->volAtt;
     double x0 = (ops[0].am ? trem : 0) + ((outputs & 1) != 0 ? va : 0);
+    /* Outside phase modulation reaches the operators the channel OUTPUTS, the
+     * way the chip's own modulator reaches its carrier; 0 changes nothing. */
+    double pm = st->pm;
+    double p0 = (outputs & 1) != 0 ? pm : 0;
     if (ops[0].vib || ops[1].vib || ops[2].vib || ops[3].vib) {
-        vibrato = vibrato_at(patch->deepVibrato, (int)(k % VIBRATO_PERIOD));
+        vibrato = te_opl_vibrato_at(patch->deepVibrato, (int)(k % VIBRATO_PERIOD));
     }
     switch (patch->kind) {
     case OPL_KIND_2OP: case OPL_KIND_BD: {
@@ -451,36 +483,42 @@ static int opl_chip_step(TaudOplState *st, int64_t k)
         advance_envelope(st, 0, &ops[0], eg);
         advance_envelope(st, 1, &ops[1], eg);
         x1 = (ops[1].am ? trem : 0) + va;
-        m = operate(st, 0, &ops[0], feedback_of(st, patch->feedback), x0, vibrato);
-        v = patch->cntA ? m + operate(st, 1, &ops[1], 0, x1, vibrato)
-                        : operate(st, 1, &ops[1], m, x1, vibrato);
+        m = operate(st, 0, &ops[0], feedback_of(st, patch->feedback) + p0, x0, vibrato);
+        v = patch->cntA ? m + operate(st, 1, &ops[1], pm, x1, vibrato)
+                        : operate(st, 1, &ops[1], m + pm, x1, vibrato);
         return patch->kind == OPL_KIND_BD ? OPL_RHYTHM_MIX * v : v;
     }
     case OPL_KIND_4OP: {
-        double x1, x2, x3;
+        double x1, x2, x3, p1, p2;
         int o1, o2, o3, i;
         for (i = 0; i < 4; i++) advance_envelope(st, i, &ops[i], eg);
-        x1 = ops[1].am ? trem : 0;
+        x1 = (ops[1].am ? trem : 0) + ((outputs & 2) != 0 ? va : 0);
         x2 = (ops[2].am ? trem : 0) + ((outputs & 4) != 0 ? va : 0);
         x3 = (ops[3].am ? trem : 0) + va;
-        o1 = operate(st, 0, &ops[0], feedback_of(st, patch->feedback), x0, vibrato);
+        p1 = (outputs & 2) != 0 ? pm : 0;
+        p2 = (outputs & 4) != 0 ? pm : 0;
+        o1 = operate(st, 0, &ops[0], feedback_of(st, patch->feedback) + p0, x0, vibrato);
         if (!patch->cntA) {
-            o2 = operate(st, 1, &ops[1], o1, x1, vibrato);
+            o2 = operate(st, 1, &ops[1], o1 + p1, x1, vibrato);
+            if (patch->cntB) {
+                /* Two pairs side by side: 1 -> 2, and 3 -> 4. */
+                o3 = operate(st, 2, &ops[2], 0, x2, vibrato);
+                return o2 + operate(st, 3, &ops[3], o3 + pm, x3, vibrato);
+            }
             o3 = operate(st, 2, &ops[2], o2, x2, vibrato);
-            return patch->cntB ? o3 + operate(st, 3, &ops[3], 0, x3, vibrato)
-                               : operate(st, 3, &ops[3], o3, x3, vibrato);
+            return operate(st, 3, &ops[3], o3 + pm, x3, vibrato);
         }
         o2 = operate(st, 1, &ops[1], 0, x1, vibrato);
-        o3 = operate(st, 2, &ops[2], o2, x2, vibrato);
+        o3 = operate(st, 2, &ops[2], o2 + p2, x2, vibrato);
         if (patch->cntB) {
             int sum = o1 + o3;
-            return sum + operate(st, 3, &ops[3], 0, x3, vibrato);
+            return sum + operate(st, 3, &ops[3], pm, x3, vibrato);
         }
-        return o1 + operate(st, 3, &ops[3], o3, x3, vibrato);
+        return o1 + operate(st, 3, &ops[3], o3 + pm, x3, vibrato);
     }
     case OPL_KIND_TOM:
         advance_envelope(st, 0, &ops[0], eg);
-        return OPL_RHYTHM_MIX * operate(st, 0, &ops[0], 0, x0, vibrato);
+        return OPL_RHYTHM_MIX * operate(st, 0, &ops[0], pm, x0, vibrato);
     case OPL_KIND_SD: case OPL_KIND_TC: case OPL_KIND_HH: {
         int hp, tp, noise, phase;
         advance_envelope(st, 0, &ops[0], eg);
@@ -497,14 +535,14 @@ static int opl_chip_step(TaudOplState *st, int64_t k)
             phase = patch->kind == OPL_KIND_HH ? (x << 9) | ((x ^ noise) ? 0x0d0 : 0x034)
                                                : (x << 9) | 0x100;
         }
-        return OPL_RHYTHM_MIX * rhythm_operator(st, 0, &ops[0], phase, x0);
+        return OPL_RHYTHM_MIX * rhythm_operator(st, 0, &ops[0], js_toint32(phase + pm) & 0x3ff, x0);
     }
     default:
         return 0;
     }
 }
 
-static bool channel_alive(const TaudOplState *st)
+bool te_opl_channel_alive(const TaudOplState *st)
 {
     const TaudOplPatch *patch = st->patch;
     int i;
@@ -533,19 +571,21 @@ static int volume_attenuation(double vol)
     return lo;
 }
 
-double te_render_opl_voice(TaudEngine *e, TaudVoice *voice, int64_t frame)
+/* The channel `st` at output frame `frame`, played at playback rate `rate`
+ * with note volume `vol`, keyed off once `keyOff` is (oplRender): the voice's
+ * render but its deactivation, so that something other than the voice it
+ * sounds on can read a chip channel — an FM rack reading it as an operator,
+ * a formant instrument as its glottal source. */
+double te_opl_render(const TaudEngine *e, TaudOplState *st, int64_t frame, double rate, double vol, bool keyOff)
 {
-    TaudOplState *st = voice->opl;
     const TaudOplPatch *patch = st->patch;
-    double rate, vol, frac;
+    double frac;
     int64_t k;
     if (patch == NULL) return 0;
-    if (voice->keyOff && st->keyed) te_opl_key_off(st);
-    rate = voice->currentPlaybackRate;
+    if (keyOff && st->keyed) te_opl_key_off(st);
     if (rate != st->rate || patch->gen != st->gen) retune(e, st, rate);
-    vol = voice->currentMixVolume;
     if (vol != st->vol) { st->vol = vol; st->volAtt = volume_attenuation(vol); }
-    k = chip_index(e, frame, &frac);
+    k = te_opl_chip_index(e, frame, &frac);
     if (!st->kValid) {
         st->k = k - 1;
         st->kValid = true;
@@ -558,6 +598,15 @@ double te_render_opl_voice(TaudEngine *e, TaudVoice *voice, int64_t frame)
         st->last = st->cur;
         st->cur = opl_chip_step(st, st->k);
     }
-    if (!channel_alive(st)) voice->active = false;
     return (st->last + (st->cur - st->last) * frac) * OUTPUT_SCALE;
+}
+
+double te_render_opl_voice(TaudEngine *e, TaudVoice *voice, int64_t frame)
+{
+    TaudOplState *st = voice->opl;
+    double s;
+    if (st->patch == NULL) return 0;
+    s = te_opl_render(e, st, frame, voice->currentPlaybackRate, voice->currentMixVolume, voice->keyOff);
+    if (!te_opl_channel_alive(st)) voice->active = false;
+    return s;
 }

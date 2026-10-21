@@ -356,6 +356,10 @@ void te_upload_sample_inst_blob(TaudEngine *e, const uint8_t *pool, size_t poolL
     e->sampleBin = pool;
     e->samplePoolLen = poolLen;
     for (i = 0; i < 1024; i++) te_inst_load_record(&e->instruments[i], instBin + (size_t)i * 256);
+    /* A chip patch may have been freed and another allocated where it was. */
+    e->formantTables.chipMemoCount = 0;
+    e->hasPsg = false;
+    for (i = 0; i < 1024; i++) if (e->instruments[i].psg != NULL) e->hasPsg = true;
     for (i = 0; i < NUM_INST_SLOTS; i++) {
         free(e->instruments[i].extraPatches);
         e->instruments[i].extraPatches = NULL;
@@ -489,6 +493,7 @@ void te_reset_play_state(TaudEngine *e)
     e->samplesIntoTick = 0.0;
     e->firstRow = true;
     e->oplFrame = 0;
+    e->psgQuarter = 0;
     e->pendingOrderJump = -1;
     e->pendingRowJump = -1;
     e->pendingRowJumpLocal = false;
@@ -588,6 +593,8 @@ void te_reset_sample_fx_state(TaudEngine *e)
     for (i = 0; i < NUM_INST_SLOTS; i++) {
         e->instruments[i].invertMaskLen = 0;
         te_inst_reset_mod(&e->instruments[i]);
+        /* The S $Axxx overlay goes with them: a new playback hears the record. */
+        if (e->instruments[i].psg != NULL) te_psg_clear_runtime(e->instruments[i].psg);
     }
 }
 
@@ -616,6 +623,7 @@ TaudEngine *te_engine_new(int rate)
     if (e->rampOutSamples < 1) e->rampOutSamples = 1;
     te_build_tables(e);
     te_formant_tables_init(&e->formantTables, rate);
+    te_psg_tables_init(e);
 
     e->instruments = (TaudInst *)calloc(NUM_INST_SLOTS, sizeof(TaudInst));
     e->playdata = (TaudCell **)calloc(NUM_PATTERNS, sizeof(TaudCell *));

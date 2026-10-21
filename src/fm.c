@@ -1,5 +1,9 @@
 /* FM operator racks — Metainstrument type 4 — port of fm.js.
  *
+ * An operator may also be a low-meta instrument — an OPL channel or a PSG
+ * pair — which is a generator rather than a waveform to read at an offset:
+ * the modulation goes into the phase of what the channel outputs.
+ *
  * A rig lives inside the voice that owns it (voice.rigStore): in the JS every
  * rig belongs to exactly one voice, is created by that voice's trigger (or by
  * a ghost's clone), and dies when the voice drops it, so embedding is exact. */
@@ -57,7 +61,34 @@ static double fm_cycle_frames(const TaudVoice *v)
     return imax(v->activeSampleLength, 1);
 }
 
-static double fm_eval_operator(TaudEngine *e, TaudFmRig *rig, int k, int interpMode, double spt, double offset)
+/* An OPL operator's value at output frame `frame`, read with `offset` cycles
+ * of phase modulation (one cycle = 1024 of the chip's phase steps), at unity
+ * volume. A channel that has rung out ends its operator. */
+static double fm_chip_operator(TaudEngine *e, TaudVoice *v, int64_t frame, double offset)
+{
+    TaudOplState *st = v->opl;
+    double s;
+    st->pm = offset == 0 ? 0 : js_round(offset * 1024);
+    s = te_opl_render(e, st, frame, v->currentPlaybackRate, 1.0, v->keyOff);
+    st->pm = 0;
+    if (!te_opl_channel_alive(st)) v->active = false;
+    return s;
+}
+
+/* A PSG operator, read the same way: one cycle of the oscillator a cycle. */
+static double fm_psg_operator(TaudEngine *e, TaudVoice *v, int64_t frame, double offset)
+{
+    TaudPsgState *st = v->psg;
+    double s;
+    st->pm = offset == 0 ? 0 : fmod(js_round((offset - floor(offset)) * 4294967296.0), 4294967296.0);
+    s = te_psg_render(e, st, frame, v->currentPlaybackRate, v->keyOff);
+    st->pm = 0;
+    if (!te_psg_channel_alive(st)) v->active = false;
+    return s;
+}
+
+static double fm_eval_operator(TaudEngine *e, TaudFmRig *rig, int k, int interpMode, double spt, double offset,
+                               int64_t frame)
 {
     TaudVoice *v;
     TaudInst *inst;
@@ -67,8 +98,14 @@ static double fm_eval_operator(TaudEngine *e, TaudFmRig *rig, int k, int interpM
     v = rig->voices[k];
     if (v == NULL || !v->active) { rig->cur[k] = 0.0; return 0.0; }
     inst = &e->instruments[v->instrumentId];
-    frames = offset == 0 ? 0 : offset * fm_cycle_frames(v);
-    s = te_fetch_tracker_sample(e, v, inst, interpMode, frames);
+    if (v->opl != NULL) {
+        s = fm_chip_operator(e, v, frame, offset);
+    } else if (v->psg != NULL) {
+        s = fm_psg_operator(e, v, frame, offset);
+    } else {
+        frames = offset == 0 ? 0 : offset * fm_cycle_frames(v);
+        s = te_fetch_tracker_sample(e, v, inst, interpMode, frames);
+    }
     g = rig->gain[k];
     if (k != 0) {
         double effEnvVol;
@@ -96,7 +133,7 @@ static double fm_eval_operator(TaudEngine *e, TaudFmRig *rig, int k, int interpM
 }
 
 /* Run the rack's algorithm for one output sample. */
-double te_render_fm_voice(TaudEngine *e, TaudVoice *voice, int interpMode, double spt)
+double te_render_fm_voice(TaudEngine *e, TaudVoice *voice, int interpMode, double spt, int64_t frame)
 {
     TaudFmRig *rig = voice->fmRig;
     const uint16_t *prog = rig->program;
@@ -138,7 +175,7 @@ double te_render_fm_voice(TaudEngine *e, TaudVoice *voice, int interpMode, doubl
             continue;
         }
         offset = cls == FM_WORD_MOD && sp > 0 ? stack[--sp] : 0.0;
-        if (sp < FM_STACK_MAX) stack[sp++] = fm_eval_operator(e, rig, k, interpMode, spt, offset);
+        if (sp < FM_STACK_MAX) stack[sp++] = fm_eval_operator(e, rig, k, interpMode, spt, offset, frame);
     }
 
     for (k = 0; k < rig->count; k++) if (rig->done[k] != 0) rig->last[k] = rig->cur[k];
