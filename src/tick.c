@@ -371,16 +371,21 @@ static int pitch_env_delta(const TaudVoice *v)
         : 0;
 }
 
-void te_apply_tracker_tick(TaudEngine *e)
+/* What a row scheduled for a later tick of itself: the note cut (S $Cx), the
+ * delayed note event (S $Dx) and the S $Dxny follow-up action. They fire at
+ * the boundary that STARTS their tick, as a row's own events fire at the
+ * boundary that starts the row (TAUD_ENGINE_SPEC.md §2.2, §6.3): the mixer's
+ * clock runs this after the tick pass and the tickInRow increment, whenever
+ * the row goes on. Inside the tick pass they fired a tick late (Microtone
+ * item 232): S $D1 sounded at tick 2, and a delay of speed − 1 on the next
+ * row's first tick. */
+void te_apply_tick_events(TaudEngine *e)
 {
-    double tickSec = 2.5 / e->bpm;
-    double spt = e->rate * tickSec;
-    int vi, i;
-
+    int vi;
     for (vi = 0; vi < MAX_VOICES; vi++) {
         TaudVoice *voice = &e->voices[vi];
-        int pitchToMixer, autoVibDelta, finalPitch;
-        if (!voice->active && voice->noteDelayTick < 0 && voice->noteActionTick < 0) continue;
+        if (voice->cutAtTick != e->tickInRow && voice->noteDelayTick != e->tickInRow &&
+            voice->noteActionTick != e->tickInRow) continue;
 
         if (voice->cutAtTick == e->tickInRow) {
             voice->noteVolume = 0;
@@ -422,6 +427,19 @@ void te_apply_tracker_tick(TaudEngine *e)
             fire_note_action(e, voice, vi);
             voice->noteActionTick = -1;
         }
+    }
+}
+
+void te_apply_tracker_tick(TaudEngine *e)
+{
+    double tickSec = 2.5 / e->bpm;
+    double spt = e->rate * tickSec;
+    int vi, i;
+
+    for (vi = 0; vi < MAX_VOICES; vi++) {
+        TaudVoice *voice = &e->voices[vi];
+        int pitchToMixer, autoVibDelta, finalPitch;
+        if (!voice->active && voice->noteDelayTick < 0 && voice->noteActionTick < 0) continue;
 
         if (!voice->active) {
             te_advance_envelope(e, voice, tickSec);

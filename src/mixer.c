@@ -161,6 +161,9 @@ bool te_generate_tracker_audio(TaudEngine *e)
                 if (e->tickInRow >= e->tickRate + e->finePatternDelayExtra) {
                     e->tickInRow = 0;
                     te_advance_row(e);
+                } else {
+                    /* what the row scheduled for the tick now starting (item 232) */
+                    te_apply_tick_events(e);
                 }
             }
         } else {

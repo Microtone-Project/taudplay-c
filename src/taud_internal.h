@@ -1332,6 +1332,7 @@ void te_reconstruct_ditto_state(TaudEngine *e, int startRow);
 
 /* tick.c */
 void te_apply_tracker_tick(TaudEngine *e);
+void te_apply_tick_events(TaudEngine *e);
 void te_psg_quarter_pass(TaudEngine *e);
 bool te_psg_live(const TaudEngine *e);
 void te_advance_sample_mod_extended(TaudEngine *e, TaudVoice *v, double spt);

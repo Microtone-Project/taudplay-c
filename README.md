@@ -278,7 +278,7 @@ for one (`sampler.c` is `sampler.js`, `tick.c` is `tick.js`, `opl.c` is
 function names, so the two can be diffed when the engine moves. (`chip.js`,
 which dispatches between the two chip kinds, is folded into `formant.c`.)
 
-In step with taudplay 3.13.1 (Microtone.js 3.13.1, engine 059e9a209c32). The
+In step with taudplay 3.13.2 (Microtone.js 3.13.2, engine 63c8b5f8a219). The
 engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
 `TaudRenderer` this library mirrors does not use it, and seeking here is
 `taud_seek_cue`, as it is there.
