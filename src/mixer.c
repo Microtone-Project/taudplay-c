@@ -3,6 +3,8 @@
  * The voices sum in binary64; the pair narrows to binary32 (the mix bus)
  * exactly once per frame, then mastering, clamp and (optionally) dither. */
 
+#include <string.h>
+
 #include "taud_internal.h"
 
 #define PI 3.141592653589793
@@ -77,31 +79,30 @@ static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int i
 
 /* ── pcm32fToPcm8: noise-shaped TPDF dither, binary32 at every step ── */
 
-static uint32_t xorshift32(TaudEngine *e)
+uint32_t te_xorshift32(uint32_t *state)
 {
-    uint32_t x = e->xorshift;
+    uint32_t x = *state;
     x ^= x << 13;
     x ^= x >> 17;
     x ^= x << 5;
-    e->xorshift = x;
+    *state = x;
     return x;
 }
 
-static float urand(TaudEngine *e) { return (float)((xorshift32(e) & 0xffffff) / 16777216.0); }
-static float tpdf1(TaudEngine *e) { float a = urand(e); float b = urand(e); return a - b; }
+static float urand(uint32_t *xs) { return (float)((te_xorshift32(xs) & 0xffffff) / 16777216.0); }
+static float tpdf1(uint32_t *xs) { float a = urand(xs); float b = urand(xs); return a - b; }
 
-void te_pcm32f_to_pcm8(TaudEngine *e, uint8_t *out)
+void te_dither_u8(uint32_t *xs, float err[4], const float *left, const float *right, size_t frames, uint8_t *out)
 {
     const float b1 = 1.5f, b2 = -0.75f, scale = 127.5f, ditherScale = 0.2f;
-    float *err = e->ditherError;
-    int i;
-    for (i = 0; i < TRACKER_CHUNK; i++) {
+    size_t i;
+    for (i = 0; i < frames; i++) {
         float feedback, dither, shaped, qerr;
         int q;
         /* left */
         feedback = (float)((float)(b1 * err[0]) + (float)(b2 * err[1]));
-        dither = (float)(ditherScale * tpdf1(e));
-        shaped = (float)((float)(e->mixLeft[i] + feedback) + (float)(dither / scale));
+        dither = (float)(ditherScale * tpdf1(xs));
+        shaped = (float)((float)(left[i] + feedback) + (float)(dither / scale));
         shaped = shaped < -1.0f ? -1.0f : shaped > 1.0f ? 1.0f : shaped;
         q = (int)js_round((float)(shaped * scale));
         q = q < -128 ? -128 : q > 127 ? 127 : q;
@@ -111,8 +112,8 @@ void te_pcm32f_to_pcm8(TaudEngine *e, uint8_t *out)
         err[0] = qerr;
         /* right */
         feedback = (float)((float)(b1 * err[2]) + (float)(b2 * err[3]));
-        dither = (float)(ditherScale * tpdf1(e));
-        shaped = (float)((float)(e->mixRight[i] + feedback) + (float)(dither / scale));
+        dither = (float)(ditherScale * tpdf1(xs));
+        shaped = (float)((float)(right[i] + feedback) + (float)(dither / scale));
         shaped = shaped < -1.0f ? -1.0f : shaped > 1.0f ? 1.0f : shaped;
         q = (int)js_round((float)(shaped * scale));
         q = q < -128 ? -128 : q > 127 ? 127 : q;
@@ -123,10 +124,110 @@ void te_pcm32f_to_pcm8(TaudEngine *e, uint8_t *out)
     }
 }
 
+void te_pcm32f_to_pcm8(TaudEngine *e, uint8_t *out)
+{
+    te_dither_u8(&e->xorshift, e->ditherError, e->mixLeft, e->mixRight, TRACKER_CHUNK, out);
+}
+
 static inline double attack_gain(const TaudEngine *e, int attackRampSamples)
 {
     int elapsed = e->attackRampSamples - attackRampSamples;
     return 0.5 - 0.5 * js_cos((PI * elapsed) / e->attackRampSamples);
+}
+
+/* Every instrument bus runs its chain over [n0, n1) and joins the mix —
+ * the stereo accumulators, or the object bus channel for channel — scaled by
+ * the song's global gain, in ascending slot order (runImixBuses). A bus whose
+ * chain is idle and was not fed is skipped outright. Each bus is then left
+ * clear for the next span. */
+static void run_imix_buses(TaudEngine *e, int n0, int n1, double globalGain)
+{
+    TaudSpatialBus *spatial = e->spatial;
+    int b, k, n, c;
+    for (b = 0; b < e->imixCount; b++) {
+        TaudImixBus *bus = e->imixList[b];
+        TaudImxChain *chain = bus->chain;
+        double *d = bus->sb.data;
+        bool hit = false;
+        /* A note on ANY instrument of a shared bus retriggers its LFOs. */
+        for (k = 0; k < bus->nSlots; k++) {
+            if (e->imixTrig[bus->slots[k]] != 0) { e->imixTrig[bus->slots[k]] = 0; hit = true; }
+        }
+        if (hit) te_imx_chain_note_on(chain);
+        if (te_imx_chain_idle(chain) && !bus->fed) {
+            te_imx_chain_process(chain, d, TRACKER_CHUNK, n0, n1, e->bpm, false);
+        } else {
+            te_imx_chain_process(chain, d, TRACKER_CHUNK, n0, n1, e->bpm, bus->fed);
+            if (spatial == NULL) {
+                for (n = n0; n < n1; n++) {
+                    e->accL[n] += d[n] * globalGain;
+                    e->accR[n] += d[TRACKER_CHUNK + n] * globalGain;
+                }
+            } else {
+                for (c = 0; c < bus->nch; c++) {
+                    int o = c * TRACKER_CHUNK;
+                    for (n = n0; n < n1; n++) spatial->data[o + n] += d[o + n] * globalGain;
+                }
+            }
+        }
+        for (c = 0; c < bus->nch; c++) memset(d + c * TRACKER_CHUNK + n0, 0, sizeof(double) * (size_t)(n1 - n0));
+        bus->fed = false;
+    }
+}
+
+/* Finish frames [n0, n1) — one of the JS mixer's spans, which end where the
+ * tick clock fires next: the buses join the mix, then every frame is folded to
+ * the device's pair, through the Amiga filters, and narrowed to binary32. It
+ * runs before that tick, so it sees the span's tempo, gain and filter state. */
+static void finish_span(TaudEngine *e, int n0, int n1)
+{
+    TaudSpatialBus *spatial = e->spatial;
+    int n;
+    if (e->imixCount > 0) {
+        double gvol = e->globalVolume / 255.0;
+        double mvol = e->mixingVolume / 255.0;
+        run_imix_buses(e, n0, n1, (gvol * mvol * e->masterVolume) / 255.0);
+    }
+    for (n = n0; n < n1; n++) {
+        double mixL, mixR;
+        if (spatial != NULL) {
+            double pair[2];
+            te_spatial_bus_stereo_at(spatial, n, pair);
+            mixL = pair[0];
+            mixR = pair[1];
+        } else {
+            mixL = e->accL[n];
+            mixR = e->accR[n];
+        }
+
+        if (e->interpolationMode == INTERP_A500) {
+            e->amigaLPStateL = mixL * e->a500A0 + e->amigaLPStateL * e->a500B1;
+            e->amigaLPStateR = mixR * e->a500A0 + e->amigaLPStateR * e->a500B1;
+            mixL = e->amigaLPStateL;
+            mixR = e->amigaLPStateR;
+        }
+        if ((e->interpolationMode == INTERP_A500 || e->interpolationMode == INTERP_A1200) && e->ledFilterOn) {
+            double *sl = e->amigaLEDStateL, *sr = e->amigaLEDStateR;
+            double outL = mixL * e->ledA1 + sl[0] * e->ledA2 + sl[1] * e->ledA1 - sl[2] * e->ledB1 - sl[3] * e->ledB2;
+            double outR = mixR * e->ledA1 + sr[0] * e->ledA2 + sr[1] * e->ledA1 - sr[2] * e->ledB1 - sr[3] * e->ledB2;
+            sl[1] = sl[0]; sl[0] = mixL; sl[3] = sl[2]; sl[2] = outL;
+            sr[1] = sr[0]; sr[0] = mixR; sr[3] = sr[2]; sr[2] = outR;
+            mixL = outL;
+            mixR = outR;
+        }
+
+        e->mixLeft[n] = (float)mixL;
+        e->mixRight[n] = (float)mixR;
+    }
+}
+
+/* The bus a voice mixes into (item 217), or NULL for the plain path: the
+ * chain of the instrument the NOTE named — a metainstrument's, not its
+ * layer's. */
+static inline TaudImixBus *voice_route(const TaudEngine *e, const TaudVoice *v)
+{
+    if (e->imixCount == 0) return NULL;
+    return e->imixRoutes[(v->displayInst != 0 ? v->displayInst : v->instrumentId) & 0x3ff];
 }
 
 /* Render one TRACKER_CHUNK into mixLeft/mixRight. */
@@ -135,7 +236,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
     bool advancing = e->isPlaying;
     TaudSpatialBus *spatial = e->spatial;
     double srate = e->rate;
-    int n, vi, i;
+    int n, vi, i, n0 = 0;
 
     if (spatial != NULL) {
         int c;
@@ -147,10 +248,20 @@ bool te_generate_tracker_audio(TaudEngine *e)
         te_apply_tracker_row(e);
     }
 
+    /* Instrument mixing chains (item 217): bring the route table up to date
+     * with the blocks, the records and the channel layout (imixGen counts
+     * every change to any of them). */
+    if (e->imixSyncedGen != e->imixGen) te_sync_imix_routes(e);
+
     for (n = 0; n < TRACKER_CHUNK; n++) {
         double spt = (srate * 2.5) / e->bpm;
-        double mixL = 0.0, mixR = 0.0;
         double gvol, mvol, globalGain;
+
+        /* A tick about to fire ends the span before it. */
+        if (n > n0 && e->samplesIntoTick + 1.0 >= spt) {
+            finish_span(e, n0, n);
+            n0 = n;
+        }
 
         if (advancing) {
             e->samplesIntoTick += 1.0;
@@ -184,10 +295,13 @@ bool te_generate_tracker_audio(TaudEngine *e)
         gvol = e->globalVolume / 255.0;
         mvol = e->mixingVolume / 255.0;
         globalGain = (gvol * mvol * e->masterVolume) / 255.0;
+        e->accL[n] = 0.0;
+        e->accR[n] = 0.0;
 
         for (vi = 0; vi < MAX_VOICES; vi++) {
             TaudVoice *voice = &e->voices[vi];
             TaudInst *inst;
+            TaudImixBus *route;
             double pair[2], sL, sR, instGv, swingScale, effEnvVol, faderGain, perVoiceGain, vol;
             double lGain = 0.0, rGain = 0.0, rampGain;
             if (!voice->active || voice->fader == 255) continue;
@@ -234,9 +348,24 @@ bool te_generate_tracker_audio(TaudEngine *e)
                 rampGain *= attack_gain(e, voice->attackRampSamples);
                 voice->attackRampSamples--;
             }
-            if (spatial == NULL) {
-                mixL += sL * vol * lGain * rampGain;
-                mixR += sR * vol * rGain * rampGain;
+            /* An instrument with a mixing chain mixes into its own bus, ahead of
+             * the song's global gain — which the bus's output gets instead. */
+            route = voice_route(e, voice);
+            if (route != NULL) {
+                route->fed = true;
+                if (spatial == NULL) {
+                    route->sb.data[n] += sL * perVoiceGain * lGain * rampGain;
+                    route->sb.data[TRACKER_CHUNK + n] += sR * perVoiceGain * rGain * rampGain;
+                } else {
+                    const double *g = te_spatial_voice_gains(e, voice);
+                    te_spatial_bus_add_source(&route->sb, n, sL * perVoiceGain, g, 0, rampGain);
+                    if (voice->activeChanCount == 2) {
+                        te_spatial_bus_add_source(&route->sb, n, sR * perVoiceGain, g, spatial->numChannels, rampGain);
+                    }
+                }
+            } else if (spatial == NULL) {
+                e->accL[n] += sL * vol * lGain * rampGain;
+                e->accR[n] += sR * vol * rGain * rampGain;
             } else {
                 const double *g = te_spatial_voice_gains(e, voice);
                 te_spatial_bus_add_source(spatial, n, sL * vol, g, 0, rampGain);
@@ -250,6 +379,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
             TaudVoice *bg = e->bg[i];
             TaudVoice *srcVoice;
             TaudInst *inst;
+            TaudImixBus *route;
             int bgFader;
             double pair[2], sL, sR, instGv, swingScale, effEnvVol, faderGain, vol;
             double lGain = 0.0, rGain = 0.0, rampGain;
@@ -297,9 +427,26 @@ bool te_generate_tracker_audio(TaudEngine *e)
                 rampGain *= attack_gain(e, bg->attackRampSamples);
                 bg->attackRampSamples--;
             }
-            if (spatial == NULL) {
-                mixL += sL * vol * lGain * rampGain;
-                mixR += sR * vol * rGain * rampGain;
+            route = voice_route(e, bg);
+            if (route != NULL) {
+                /* The same chain without the three song-level gains the bus is ahead of. */
+                double bvol = effEnvVol * bg->fadeoutVolume *
+                    (bg->opl != NULL && bg->fmRig == NULL ? 1.0 : bg->currentMixVolume) *
+                    swingScale * instGv * faderGain * bg->layerMixGain * bg->activeAttenGain;
+                route->fed = true;
+                if (spatial == NULL) {
+                    route->sb.data[n] += sL * bvol * lGain * rampGain;
+                    route->sb.data[TRACKER_CHUNK + n] += sR * bvol * rGain * rampGain;
+                } else {
+                    const double *g = te_spatial_voice_gains(e, bg);
+                    te_spatial_bus_add_source(&route->sb, n, sL * bvol, g, 0, rampGain);
+                    if (bg->activeChanCount == 2) {
+                        te_spatial_bus_add_source(&route->sb, n, sR * bvol, g, spatial->numChannels, rampGain);
+                    }
+                }
+            } else if (spatial == NULL) {
+                e->accL[n] += sL * vol * lGain * rampGain;
+                e->accR[n] += sR * vol * rGain * rampGain;
             } else {
                 const double *g = te_spatial_voice_gains(e, bg);
                 te_spatial_bus_add_source(spatial, n, sL * vol, g, 0, rampGain);
@@ -308,33 +455,8 @@ bool te_generate_tracker_audio(TaudEngine *e)
                 }
             }
         }
-
-        if (spatial != NULL) {
-            double pair[2];
-            te_spatial_bus_stereo_at(spatial, n, pair);
-            mixL = pair[0];
-            mixR = pair[1];
-        }
-
-        if (e->interpolationMode == INTERP_A500) {
-            e->amigaLPStateL = mixL * e->a500A0 + e->amigaLPStateL * e->a500B1;
-            e->amigaLPStateR = mixR * e->a500A0 + e->amigaLPStateR * e->a500B1;
-            mixL = e->amigaLPStateL;
-            mixR = e->amigaLPStateR;
-        }
-        if ((e->interpolationMode == INTERP_A500 || e->interpolationMode == INTERP_A1200) && e->ledFilterOn) {
-            double *sl = e->amigaLEDStateL, *sr = e->amigaLEDStateR;
-            double outL = mixL * e->ledA1 + sl[0] * e->ledA2 + sl[1] * e->ledA1 - sl[2] * e->ledB1 - sl[3] * e->ledB2;
-            double outR = mixR * e->ledA1 + sr[0] * e->ledA2 + sr[1] * e->ledA1 - sr[2] * e->ledB1 - sr[3] * e->ledB2;
-            sl[1] = sl[0]; sl[0] = mixL; sl[3] = sl[2]; sl[2] = outL;
-            sr[1] = sr[0]; sr[0] = mixR; sr[3] = sr[2]; sr[2] = outR;
-            mixL = outL;
-            mixR = outR;
-        }
-
-        e->mixLeft[n] = (float)mixL;
-        e->mixRight[n] = (float)mixR;
     }
+    finish_span(e, n0, TRACKER_CHUNK);
 
     if (e->mastering != NULL) te_master_chain_process(e->mastering, e->mixLeft, e->mixRight, TRACKER_CHUNK);
     /* The OPL chip clock (item 209) counts the frames this playhead has mixed. */

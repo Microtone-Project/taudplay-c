@@ -4,6 +4,7 @@
  *   taudplay song.taud                     describe the file
  *   taudplay song.taud -o out.wav          render song 0 to a 48 kHz WAV
  *   taudplay song.taud -s 2 -t 60 -o x.wav song 2, at most 60 seconds
+ *   taudplay song.taud --gritty -o x.wav   the device's own 8-bit sound
  *   taudplay song.taud --raw out.f32       interleaved stereo float32
  *   taudplay song.taud --raw - | ffplay -f f32le -ar 48000 -ac 2 -i pipe:0
  *   taudplay song.taud --interrupts        print the cue sheet the song fires
@@ -25,7 +26,10 @@ static void usage(void)
 {
     fprintf(stderr,
         "usage: taudplay FILE.taud [options]\n"
-        "  -o FILE.wav        render to a 16-bit stereo WAV (- = stdout)\n"
+        "  -o FILE.wav        render to a stereo WAV (- = stdout): clean, 16-bit\n"
+        "                     with a light TPDF dither\n"
+        "  --gritty           make the WAV 8-bit through the device's own\n"
+        "                     noise-shaped dither instead\n"
         "  --raw FILE         stream interleaved stereo float32 little-endian at the\n"
         "                     engine rate (- = stdout, e.g. for ffplay -f f32le)\n"
         "  --s16              make --raw signed 16-bit little-endian instead\n"
@@ -115,7 +119,7 @@ int main(int argc, char **argv)
 {
     const char *in = NULL, *wavOut = NULL, *rawOut = NULL, *mute = NULL;
     double seconds = 600;
-    int wavRate = 0, printInts = 0, s16 = 0, i;
+    int wavRate = 0, printInts = 0, s16 = 0, gritty = 0, i;
     TaudConfig cfg;
     TaudError err;
     TaudPlayer *p;
@@ -136,6 +140,7 @@ int main(int argc, char **argv)
         else if (strcmp(a, "--seed") == 0 && i + 1 < argc) cfg.random_seed = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (strcmp(a, "--interrupts") == 0) printInts = 1;
         else if (strcmp(a, "--s16") == 0) s16 = 1;
+        else if (strcmp(a, "--gritty") == 0) gritty = 1;
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(); return 0; }
         else if (a[0] != '-' && in == NULL) in = a;
         else { usage(); return 2; }
@@ -223,7 +228,8 @@ int main(int argc, char **argv)
         }
         if (wavOut != NULL && status == 0) {
             size_t wlen;
-            uint8_t *wav = taud_encode_wav(pcm, frames, g_rate, wavRate > 0 ? wavRate : g_rate, &wlen);
+            uint8_t *wav = taud_encode_wav_quality(pcm, frames, g_rate, wavRate > 0 ? wavRate : g_rate,
+                                                   gritty ? TAUD_WAV_GRITTY : TAUD_WAV_CLEAN, &wlen);
             int toStdout = strcmp(wavOut, "-") == 0;
             FILE *f = wav == NULL ? NULL : toStdout ? stdout : fopen(wavOut, "wb");
             if (toStdout) set_binary(stdout);

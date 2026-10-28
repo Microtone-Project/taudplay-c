@@ -1,5 +1,8 @@
 /* Master-bus mastering chain — port of mastering.js, the TruePeakProbe of
- * analysis.js and the `sMst` block decoder of mastering-section.js.
+ * analysis.js and the `sMst` block decoder of mastering-section.js. The
+ * biquad, the compressor and the limiter are exported (te_bq_*, te_comp_*,
+ * te_lim_*) at any channel count up to TE_MAX_BUS_CH, for the instrument
+ * chains (imix.c), as mastering.js exports them to imix.js.
  *
  *     trim → high-pass → 4-band EQ → compressor → width → limiter → gain
  *
@@ -14,7 +17,8 @@
 #define PI 3.141592653589793
 #define LIMITER_LOOKAHEAD_MS 1.0
 
-static double db_to_gain(double db) { return js_pow(10.0, db / 20); }
+double te_db_to_gain(double db) { return js_pow(10.0, db / 20); }
+#define db_to_gain te_db_to_gain
 
 /* ── parameters ── */
 
@@ -109,34 +113,21 @@ bool te_mastering_parse_block(const uint8_t *b, size_t len, TaudMastering *p)
 
 /* ── biquad (RBJ, Direct Form I, normalised to a0) ── */
 
-typedef struct {
-    double b0, b1, b2, a1, a2;
-    double x1[2], x2[2], y1[2], y2[2];
-} Biquad;
-
-static void bq_init(Biquad *s) { memset(s, 0, sizeof *s); s->b0 = 1; }
-static void bq_reset(Biquad *s)
+void te_bq_init(TaudBiquad *s) { memset(s, 0, sizeof *s); s->b0 = 1; }
+void te_bq_reset(TaudBiquad *s)
 {
     memset(s->x1, 0, sizeof s->x1); memset(s->x2, 0, sizeof s->x2);
     memset(s->y1, 0, sizeof s->y1); memset(s->y2, 0, sizeof s->y2);
 }
 
-static inline double bq_run(Biquad *s, int c, double x)
-{
-    double y = s->b0 * x + s->b1 * s->x1[c] + s->b2 * s->x2[c] - s->a1 * s->y1[c] - s->a2 * s->y2[c];
-    s->x2[c] = s->x1[c]; s->x1[c] = x;
-    s->y2[c] = s->y1[c]; s->y1[c] = y;
-    return y;
-}
-
-static void bq_set(Biquad *s, double b0, double b1, double b2, double a0, double a1, double a2)
+static void bq_set(TaudBiquad *s, double b0, double b1, double b2, double a0, double a1, double a2)
 {
     double inv = 1 / a0;
     s->b0 = b0 * inv; s->b1 = b1 * inv; s->b2 = b2 * inv;
     s->a1 = a1 * inv; s->a2 = a2 * inv;
 }
 
-static void bq_high_pass(Biquad *s, double freq, double q, double rate)
+void te_bq_high_pass(TaudBiquad *s, double freq, double q, double rate)
 {
     double w = (2 * PI * dmin(freq, rate * 0.49)) / rate;
     double cw = js_cos(w), sw = js_sin(w);
@@ -144,7 +135,42 @@ static void bq_high_pass(Biquad *s, double freq, double q, double rate)
     bq_set(s, (1 + cw) / 2, -(1 + cw), (1 + cw) / 2, 1 + alpha, -2 * cw, 1 - alpha);
 }
 
-static void bq_peaking(Biquad *s, double freq, double gainDb, double q, double rate)
+void te_bq_low_pass(TaudBiquad *s, double freq, double q, double rate)
+{
+    double w = (2 * PI * dmin(freq, rate * 0.49)) / rate;
+    double cw = js_cos(w), sw = js_sin(w);
+    double alpha = sw / (2 * q);
+    bq_set(s, (1 - cw) / 2, 1 - cw, (1 - cw) / 2, 1 + alpha, -2 * cw, 1 - alpha);
+}
+
+/* Constant 0 dB peak gain (a dynamic EQ's sensor). */
+void te_bq_band_pass(TaudBiquad *s, double freq, double q, double rate)
+{
+    double w = (2 * PI * dmin(freq, rate * 0.49)) / rate;
+    double cw = js_cos(w), sw = js_sin(w);
+    double alpha = sw / (2 * q);
+    bq_set(s, alpha, 0, -alpha, 1 + alpha, -2 * cw, 1 - alpha);
+}
+
+void te_bq_notch(TaudBiquad *s, double freq, double q, double rate)
+{
+    double w = (2 * PI * dmin(freq, rate * 0.49)) / rate;
+    double cw = js_cos(w), sw = js_sin(w);
+    double alpha = sw / (2 * q);
+    bq_set(s, 1, -2 * cw, 1, 1 + alpha, -2 * cw, 1 - alpha);
+}
+
+/* At Q = 1/√2, what a Linkwitz–Riley 4th-order low-pass and high-pass at the
+ * same frequency sum to (a multiband split's phase matching). */
+void te_bq_all_pass(TaudBiquad *s, double freq, double q, double rate)
+{
+    double w = (2 * PI * dmin(freq, rate * 0.49)) / rate;
+    double cw = js_cos(w), sw = js_sin(w);
+    double alpha = sw / (2 * q);
+    bq_set(s, 1 - alpha, -2 * cw, 1 + alpha, 1 + alpha, -2 * cw, 1 - alpha);
+}
+
+void te_bq_peaking(TaudBiquad *s, double freq, double gainDb, double q, double rate)
 {
     double A = js_pow(10.0, gainDb / 40);
     double w = (2 * PI * dmin(freq, rate * 0.49)) / rate;
@@ -153,7 +179,7 @@ static void bq_peaking(Biquad *s, double freq, double gainDb, double q, double r
     bq_set(s, 1 + alpha * A, -2 * cw, 1 - alpha * A, 1 + alpha / A, -2 * cw, 1 - alpha / A);
 }
 
-static void bq_low_shelf(Biquad *s, double freq, double gainDb, double q, double rate)
+void te_bq_low_shelf(TaudBiquad *s, double freq, double gainDb, double q, double rate)
 {
     double A = js_pow(10.0, gainDb / 40);
     double w = (2 * PI * dmin(freq, rate * 0.49)) / rate;
@@ -168,7 +194,7 @@ static void bq_low_shelf(Biquad *s, double freq, double gainDb, double q, double
               (A + 1) + (A - 1) * cw - tsa);
 }
 
-static void bq_high_shelf(Biquad *s, double freq, double gainDb, double q, double rate)
+void te_bq_high_shelf(TaudBiquad *s, double freq, double gainDb, double q, double rate)
 {
     double A = js_pow(10.0, gainDb / 40);
     double w = (2 * PI * dmin(freq, rate * 0.49)) / rate;
@@ -187,13 +213,7 @@ static void bq_high_shelf(Biquad *s, double freq, double gainDb, double q, doubl
 
 #define SLIDING_REBASE 0x20000000
 
-typedef struct {
-    int width, cap;
-    double *val;
-    int32_t *at;
-    int head, tail;
-    int32_t n;
-} SlidingMin;
+typedef TaudSlidingMin SlidingMin;
 
 static bool sm_init(SlidingMin *m, int width)
 {
@@ -234,11 +254,6 @@ static double sm_push(SlidingMin *m, double v)
 
 /* ── true-peak probe (4× polyphase, 8 taps a phase) ── */
 
-#define TP_PHASES 4
-#define TP_TAPS 8
-
-typedef struct { double hist[TP_TAPS]; } TruePeakProbe;
-
 static void tp_coef(double h[TP_PHASES * TP_TAPS])
 {
     int n = TP_PHASES * TP_TAPS, i, p, k;
@@ -255,7 +270,7 @@ static void tp_coef(double h[TP_PHASES * TP_TAPS])
     }
 }
 
-static double tp_push(TruePeakProbe *pr, const double *coef, double v)
+static double tp_push(TaudTruePeakProbe *pr, const double *coef, double v)
 {
     double *h = pr->hist, hi;
     int k, p;
@@ -273,35 +288,41 @@ static double tp_push(TruePeakProbe *pr, const double *coef, double v)
 
 /* ── stages ── */
 
-static double one_pole(double ms, double rate)
+double te_one_pole(double ms, double rate)
 {
     double n = (ms / 1000) * rate;
     return n <= 0 ? 1 : 1 - js_exp(-1 / n);
 }
+#define one_pole te_one_pole
 
-typedef struct {
-    double grDb, rms, rmsCoef, attackCoef, releaseCoef, thresh, ratio, knee, makeup;
-    bool peakMode;
-} Compressor;
-
-static void comp_configure(Compressor *c, const TaudMastering *p, double rate)
+void te_comp_configure(TaudCompressor *c, int detector, double threshDb, double ratio, double attackMs,
+                       double releaseMs, double kneeDb, double makeupDb, double rate)
 {
-    c->peakMode = p->compDetector != COMP_RMS;
-    c->thresh = p->compThreshDb;
-    c->ratio = p->compRatio;
-    c->knee = p->compKneeDb;
-    c->makeup = db_to_gain(p->compMakeupDb);
-    c->attackCoef = one_pole(p->compAttackMs, rate);
-    c->releaseCoef = one_pole(p->compReleaseMs, rate);
+    c->peakMode = detector != COMP_RMS;
+    c->thresh = threshDb;
+    c->ratio = ratio;
+    c->knee = kneeDb;
+    c->makeup = db_to_gain(makeupDb);
+    c->attackCoef = one_pole(attackMs, rate);
+    c->releaseCoef = one_pole(releaseMs, rate);
     c->rmsCoef = one_pole(10, rate);
 }
 
-static double comp_advance(Compressor *c, double level)
+void te_comp_reset(TaudCompressor *c) { c->grDb = 0; c->rms = 0; c->levelDb = -120; }
+
+static void comp_configure(TaudCompressor *c, const TaudMastering *p, double rate)
+{
+    te_comp_configure(c, p->compDetector, p->compThreshDb, p->compRatio, p->compAttackMs,
+                      p->compReleaseMs, p->compKneeDb, p->compMakeupDb, rate);
+}
+
+static double comp_advance(TaudCompressor *c, double level)
 {
     double levelDb = level > 1e-6 ? 20 * js_log10(level) : -120;
     double over = levelDb - c->thresh;
     double half = c->knee * 0.5;
     double targetDb, coef;
+    c->levelDb = levelDb;
     if (c->knee > 0 && over > -half && over < half) {
         double t = over + half;
         targetDb = -((1 - 1 / c->ratio) * t * t) / (2 * c->knee);
@@ -315,7 +336,7 @@ static double comp_advance(Compressor *c, double level)
     return db_to_gain(c->grDb) * c->makeup;
 }
 
-static double comp_step(Compressor *c, double l, double r)
+static double comp_step(TaudCompressor *c, double l, double r)
 {
     double level;
     if (c->peakMode) {
@@ -330,26 +351,49 @@ static double comp_step(Compressor *c, double l, double r)
     return comp_advance(c, level);
 }
 
-typedef struct {
-    int d, dstride, dpos;
-    double *delay;
-    SlidingMin min;
-    bool hasMin;
-    double *avg;
-    int avgLen;
-    double avgSum;
-    int apos;
-    double env, releaseCoef, ceiling;
-    bool truePeak;
-    TruePeakProbe probes[2];
-    double grDb;
-} Limiter;
+/* The same detector over `nch` planar channels of a channel-major buffer
+ * (stepPlanar): the peak over every channel of the frame, or the mean square
+ * of all of them. */
+double te_comp_step_planar(TaudCompressor *c, const double *data, int n, int stride, int nch)
+{
+    double level;
+    int ch;
+    if (c->peakMode) {
+        level = 0;
+        for (ch = 0; ch < nch; ch++) {
+            double x = data[ch * stride + n];
+            double a = x < 0 ? -x : x;
+            if (a > level) level = a;
+        }
+    } else {
+        double sum = 0;
+        for (ch = 0; ch < nch; ch++) { double x = data[ch * stride + n]; sum += x * x; }
+        c->rms += (sum / nch - c->rms) * c->rmsCoef;
+        level = sqrt(c->rms);
+    }
+    return comp_advance(c, level);
+}
 
-static void lim_reset(Limiter *L)
+void te_lim_init(TaudLimiter *L, int nch)
+{
+    memset(L, 0, sizeof *L);
+    L->nch = nch;
+    tp_coef(L->tpCoef);
+}
+
+void te_lim_free(TaudLimiter *L)
+{
+    free(L->delay);
+    free(L->avg);
+    if (L->hasMin) sm_free(&L->min);
+    L->delay = NULL; L->avg = NULL; L->hasMin = false;
+}
+
+void te_lim_reset(TaudLimiter *L)
 {
     int i;
     if (L->d == 0) return;
-    memset(L->delay, 0, sizeof(double) * 2 * L->dstride);
+    memset(L->delay, 0, sizeof(double) * (size_t)L->nch * L->dstride);
     L->dpos = 0;
     sm_reset(&L->min, 1.0);
     for (i = 0; i < L->avgLen; i++) L->avg[i] = 1.0;
@@ -360,30 +404,33 @@ static void lim_reset(Limiter *L)
     L->grDb = 0;
 }
 
-static bool lim_configure(Limiter *L, const TaudMastering *p, double rate)
+bool te_lim_configure(TaudLimiter *L, double ceilingDb, bool truePeak, double releaseMs, double rate)
 {
     int d = imax(1, (int)js_round((LIMITER_LOOKAHEAD_MS / 1000) * rate));
     bool geometryChanged = d != L->d;
     if (geometryChanged) {
-        free(L->delay);
-        free(L->avg);
-        if (L->hasMin) sm_free(&L->min);
+        te_lim_free(L);
         L->d = d;
         L->dstride = 2 * d;
-        L->delay = (double *)calloc((size_t)2 * L->dstride, sizeof(double));
+        L->delay = (double *)calloc((size_t)L->nch * L->dstride, sizeof(double));
         L->hasMin = sm_init(&L->min, 2 * d + 1);
         L->avgLen = d + 1;
         L->avg = (double *)calloc((size_t)L->avgLen, sizeof(double));
         if (L->delay == NULL || !L->hasMin || L->avg == NULL) { L->d = 0; return false; }
     }
-    L->ceiling = db_to_gain(p->limCeilingDb);
-    L->truePeak = p->limTruePeak;
-    L->releaseCoef = one_pole(p->limReleaseMs, rate);
-    if (geometryChanged) lim_reset(L);
+    L->ceiling = db_to_gain(ceilingDb);
+    L->truePeak = truePeak;
+    L->releaseCoef = one_pole(releaseMs, rate);
+    if (geometryChanged) te_lim_reset(L);
     return true;
 }
 
-static double lim_advance(Limiter *L, double peak)
+static bool lim_configure(TaudLimiter *L, const TaudMastering *p, double rate)
+{
+    return te_lim_configure(L, p->limCeilingDb, p->limTruePeak, p->limReleaseMs, rate);
+}
+
+static double lim_advance(TaudLimiter *L, double peak)
 {
     double need = peak > L->ceiling ? L->ceiling / peak : 1;
     double m = sm_push(&L->min, need);
@@ -401,19 +448,40 @@ static double lim_advance(Limiter *L, double peak)
     return gain;
 }
 
+/* One frame in place over `nch` planar channels of a channel-major buffer
+ * (stepPlanar): the peak across every channel, then the delayed frame out. */
+void te_lim_step_planar(TaudLimiter *L, double *data, int n, int stride)
+{
+    int nch = L->nch, ch, s = L->dstride, i = L->dpos;
+    double peak = 0, gain;
+    for (ch = 0; ch < nch; ch++) {
+        double x = data[ch * stride + n];
+        double a = L->truePeak ? tp_push(&L->probes[ch], L->tpCoef, x) : (x < 0 ? -x : x);
+        if (a > peak) peak = a;
+    }
+    gain = lim_advance(L, peak);
+    for (ch = 0; ch < nch; ch++) {
+        int j = ch * s + i;
+        int k = ch * stride + n;
+        double held = L->delay[j];
+        L->delay[j] = data[k];
+        data[k] = held * gain;
+    }
+    L->dpos = i + 1 == s ? 0 : i + 1;
+}
+
 /* ── the chain ── */
 
 struct TaudMasterChain {
     double rate;
     TaudMastering params;
-    Biquad hp1, hp2;
+    TaudBiquad hp1, hp2;
     bool hpTwo;
-    Biquad eq[EQ_BANDS];
+    TaudBiquad eq[EQ_BANDS];
     int eqLive[EQ_BANDS];
     int eqLiveCount;
-    Compressor comp;
-    Limiter lim;
-    double tpCoef[TP_PHASES * TP_TAPS];
+    TaudCompressor comp;
+    TaudLimiter lim;
     double trimGain, outGain, width;
     bool engaged;
 };
@@ -424,10 +492,10 @@ TaudMasterChain *te_master_chain_new(const TaudMastering *p, int rate)
     int i;
     if (c == NULL) return NULL;
     c->rate = rate;
-    bq_init(&c->hp1);
-    bq_init(&c->hp2);
-    for (i = 0; i < EQ_BANDS; i++) bq_init(&c->eq[i]);
-    tp_coef(c->tpCoef);
+    te_bq_init(&c->hp1);
+    te_bq_init(&c->hp2);
+    for (i = 0; i < EQ_BANDS; i++) te_bq_init(&c->eq[i]);
+    te_lim_init(&c->lim, 2);
     te_mastering_default(&c->params);
     te_master_chain_set_params(c, p != NULL ? p : &c->params);
     return c;
@@ -436,9 +504,7 @@ TaudMasterChain *te_master_chain_new(const TaudMastering *p, int rate)
 void te_master_chain_free(TaudMasterChain *c)
 {
     if (c == NULL) return;
-    free(c->lim.delay);
-    free(c->lim.avg);
-    if (c->lim.hasMin) sm_free(&c->lim.min);
+    te_lim_free(&c->lim);
     free(c);
 }
 
@@ -452,10 +518,10 @@ void te_master_chain_set_params(TaudMasterChain *c, const TaudMastering *pp)
     if (p.hpOn) {
         c->hpTwo = p.hpSlope == HP_SLOPE_24;
         if (c->hpTwo) {
-            bq_high_pass(&c->hp1, p.hpFreq, 0.5411961001461969, c->rate);
-            bq_high_pass(&c->hp2, p.hpFreq, 1.3065629648763766, c->rate);
+            te_bq_high_pass(&c->hp1, p.hpFreq, 0.5411961001461969, c->rate);
+            te_bq_high_pass(&c->hp2, p.hpFreq, 1.3065629648763766, c->rate);
         } else {
-            bq_high_pass(&c->hp1, p.hpFreq, 0.7071067811865476, c->rate);
+            te_bq_high_pass(&c->hp1, p.hpFreq, 0.7071067811865476, c->rate);
         }
     }
     if (p.eqOn) {
@@ -464,9 +530,9 @@ void te_master_chain_set_params(TaudMasterChain *c, const TaudMastering *pp)
         for (i = 0; i < EQ_BANDS; i++) {
             const TaudEqBand *b = &p.eq[i];
             if (!b->on) continue;
-            if (b->type == EQ_LOW_SHELF) bq_low_shelf(&c->eq[i], b->freq, b->gainDb, b->q, c->rate);
-            else if (b->type == EQ_HIGH_SHELF) bq_high_shelf(&c->eq[i], b->freq, b->gainDb, b->q, c->rate);
-            else bq_peaking(&c->eq[i], b->freq, b->gainDb, b->q, c->rate);
+            if (b->type == EQ_LOW_SHELF) te_bq_low_shelf(&c->eq[i], b->freq, b->gainDb, b->q, c->rate);
+            else if (b->type == EQ_HIGH_SHELF) te_bq_high_shelf(&c->eq[i], b->freq, b->gainDb, b->q, c->rate);
+            else te_bq_peaking(&c->eq[i], b->freq, b->gainDb, b->q, c->rate);
             c->eqLive[c->eqLiveCount++] = i;
         }
     }
@@ -478,12 +544,11 @@ void te_master_chain_set_params(TaudMasterChain *c, const TaudMastering *pp)
 void te_master_chain_reset(TaudMasterChain *c)
 {
     int i;
-    bq_reset(&c->hp1);
-    bq_reset(&c->hp2);
-    for (i = 0; i < EQ_BANDS; i++) bq_reset(&c->eq[i]);
-    c->comp.grDb = 0;
-    c->comp.rms = 0;
-    lim_reset(&c->lim);
+    te_bq_reset(&c->hp1);
+    te_bq_reset(&c->hp2);
+    for (i = 0; i < EQ_BANDS; i++) te_bq_reset(&c->eq[i]);
+    te_comp_reset(&c->comp);
+    te_lim_reset(&c->lim);
 }
 
 void te_master_chain_process(TaudMasterChain *c, float *left, float *right, int frames)
@@ -505,14 +570,14 @@ void te_master_chain_process(TaudMasterChain *c, float *left, float *right, int 
         double l = left[n] * trim;
         double r = right[n] * trim;
         if (doHp) {
-            l = bq_run(&c->hp1, 0, l);
-            if (c->hpTwo) l = bq_run(&c->hp2, 0, l);
-            r = bq_run(&c->hp1, 1, r);
-            if (c->hpTwo) r = bq_run(&c->hp2, 1, r);
+            l = te_bq_run(&c->hp1, 0, l);
+            if (c->hpTwo) l = te_bq_run(&c->hp2, 0, l);
+            r = te_bq_run(&c->hp1, 1, r);
+            if (c->hpTwo) r = te_bq_run(&c->hp2, 1, r);
         }
         if (doEq) {
-            for (i = 0; i < c->eqLiveCount; i++) l = bq_run(&c->eq[c->eqLive[i]], 0, l);
-            for (i = 0; i < c->eqLiveCount; i++) r = bq_run(&c->eq[c->eqLive[i]], 1, r);
+            for (i = 0; i < c->eqLiveCount; i++) l = te_bq_run(&c->eq[c->eqLive[i]], 0, l);
+            for (i = 0; i < c->eqLiveCount; i++) r = te_bq_run(&c->eq[c->eqLive[i]], 1, r);
         }
         if (doComp) {
             double g = comp_step(&c->comp, l, r);
@@ -524,9 +589,9 @@ void te_master_chain_process(TaudMasterChain *c, float *left, float *right, int 
             l = m + s; r = m - s;
         }
         if (doLim) {
-            Limiter *L = &c->lim;
-            double pl = L->truePeak ? tp_push(&L->probes[0], c->tpCoef, l) : (l < 0 ? -l : l);
-            double pr = L->truePeak ? tp_push(&L->probes[1], c->tpCoef, r) : (r < 0 ? -r : r);
+            TaudLimiter *L = &c->lim;
+            double pl = L->truePeak ? tp_push(&L->probes[0], L->tpCoef, l) : (l < 0 ? -l : l);
+            double pr = L->truePeak ? tp_push(&L->probes[1], L->tpCoef, r) : (r < 0 ? -r : r);
             double gain = lim_advance(L, pl > pr ? pl : pr);
             int s = L->dstride, di = L->dpos;
             double dl = L->delay[di];

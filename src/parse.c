@@ -96,6 +96,7 @@ void te_doc_free(TaudDoc *doc)
     free(doc->projData);
     free(doc->ixmp);
     free(doc->projectName);
+    free(doc->imix);
     memset(doc, 0, sizeof *doc);
 }
 
@@ -253,7 +254,7 @@ TaudError te_parse_taud(const uint8_t *file, size_t len, TaudDoc *doc)
         }
     }
 
-    /* ── decoded views: Ixmp, PNam, sMet, sMst ── */
+    /* ── decoded views: Ixmp, PNam, sMet, sMst, IMix ── */
     sec = find_sec(secs, nSecs, "Ixmp");
     if (sec != NULL) {
         const uint8_t *pl = doc->projData + sec->off;
@@ -324,6 +325,14 @@ TaudError te_parse_taud(const uint8_t *file, size_t len, TaudDoc *doc)
             p = sub + subLen;
         }
     }
+    /* The instruments' mixing chains (§9.15) — another section a player has
+     * to honour. */
+    sec = find_sec(secs, nSecs, "IMix");
+    if (sec != NULL) {
+        int n = te_imix_parse_section(doc->projData + sec->off, sec->len, &doc->imix);
+        if (n < 0) { err = TAUD_ERR_NOMEM; goto fail; }
+        doc->numImix = n;
+    }
     free(secs);
     return TAUD_OK;
 
@@ -376,6 +385,8 @@ void te_load_into_engine(TaudEngine *e, const TaudDoc *doc, int songIndex)
     e->mixingVolume = song->mixingVolume & 255;
     e->masterVolume = 255;
     te_set_mastering(e, song->hasMastering ? &song->mastering : NULL);
+    /* …and the instruments' mixing chains (item 217), for the same reason. */
+    te_set_imix(e, doc->imix, doc->numImix);
 
     for (p = 0; p < doc->numIxmp; p++) {
         te_upload_instrument_patches(e, doc->ixmp[p].instId, doc->ixmp[p].blob, doc->ixmp[p].len);

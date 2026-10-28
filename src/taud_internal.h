@@ -156,6 +156,9 @@ double js_log(double x);
 double js_acos(double x);
 double js_asin(double x);
 double js_atan2(double y, double x);
+double js_log1p(double x);
+double js_expm1(double x);
+double js_tanh(double x);
 double js_fdlibm_pow(double x, double y);
 #ifdef TAUD_LIBM_POW
 #define js_pow pow
@@ -200,6 +203,9 @@ typedef struct {
 #define META_TYPE_FM 4
 #define META_LAYER_FIXED_PITCH 0x40
 #define FM_MAX_OPERATORS 16
+/* Bytes 4…253 hold an FM rack and its program; byte 255 is every record's
+ * IMix id (item 217) and byte 254 stays clear (FM_PROGRAM_END). */
+#define FM_PROGRAM_END 254
 #define FM_STACK_MAX 16
 #define FM_WORD_OSC 0x0000
 #define FM_WORD_MOD 0x0400
@@ -222,6 +228,7 @@ typedef struct {
     int count;
     TaudMetaLayer layers[META_MAX_LAYERS];
     uint8_t flags;              /* record byte 0 */
+    uint8_t imixId;             /* record byte 255: the IMix block (§9.15) */
     bool strict;
     int type;
     bool hasProgram;            /* FM: did the program decode? */
@@ -497,6 +504,9 @@ typedef struct TaudInst {
 } TaudInst;
 
 static inline bool inst_is_meta(const TaudInst *i) { return i->meta != NULL; }
+/* The IMix block the instrument's voices mix through (byte 255; 0 = none):
+ * a metainstrument's verbatim record, every other kind's reserved tail. */
+static inline int inst_imix_id(const TaudInst *i) { return i->meta != NULL ? i->meta->imixId : i->reserved[4]; }
 static inline bool inst_is_fm(const TaudInst *i) { return i->meta != NULL && i->meta->type == META_TYPE_FM; }
 static inline int inst_new_note_action(const TaudInst *i)
 {
@@ -888,6 +898,85 @@ typedef struct {
 
 typedef struct TaudMasterChain TaudMasterChain;
 
+/* The chain's stages, exported for the instrument chains (imix.c) at any
+ * channel count up to TE_MAX_BUS_CH — the widest bus a song can have. */
+#define TE_MAX_BUS_CH 16
+
+/* An RBJ section, Direct Form I: one set of coefficients, a delay line per
+ * channel. */
+typedef struct {
+    double b0, b1, b2, a1, a2;
+    double x1[TE_MAX_BUS_CH], x2[TE_MAX_BUS_CH], y1[TE_MAX_BUS_CH], y2[TE_MAX_BUS_CH];
+} TaudBiquad;
+
+static inline double te_bq_run(TaudBiquad *s, int c, double x)
+{
+    double y = s->b0 * x + s->b1 * s->x1[c] + s->b2 * s->x2[c] - s->a1 * s->y1[c] - s->a2 * s->y2[c];
+    s->x2[c] = s->x1[c]; s->x1[c] = x;
+    s->y2[c] = s->y1[c]; s->y1[c] = y;
+    return y;
+}
+
+void te_bq_init(TaudBiquad *s);
+void te_bq_reset(TaudBiquad *s);
+void te_bq_high_pass(TaudBiquad *s, double freq, double q, double rate);
+void te_bq_low_pass(TaudBiquad *s, double freq, double q, double rate);
+void te_bq_band_pass(TaudBiquad *s, double freq, double q, double rate);
+void te_bq_notch(TaudBiquad *s, double freq, double q, double rate);
+void te_bq_all_pass(TaudBiquad *s, double freq, double q, double rate);
+void te_bq_peaking(TaudBiquad *s, double freq, double gainDb, double q, double rate);
+void te_bq_low_shelf(TaudBiquad *s, double freq, double gainDb, double q, double rate);
+void te_bq_high_shelf(TaudBiquad *s, double freq, double gainDb, double q, double rate);
+
+double te_db_to_gain(double db);
+double te_one_pole(double ms, double rate);
+
+typedef struct {
+    double grDb, levelDb, rms, rmsCoef, attackCoef, releaseCoef, thresh, ratio, knee, makeup;
+    bool peakMode;
+} TaudCompressor;
+
+void te_comp_configure(TaudCompressor *c, int detector, double threshDb, double ratio, double attackMs,
+                       double releaseMs, double kneeDb, double makeupDb, double rate);
+void te_comp_reset(TaudCompressor *c);
+double te_comp_step_planar(TaudCompressor *c, const double *data, int n, int stride, int nch);
+
+#define TP_PHASES 4
+#define TP_TAPS 8
+typedef struct { double hist[TP_TAPS]; } TaudTruePeakProbe;
+
+typedef struct {
+    int width, cap;
+    double *val;
+    int32_t *at;
+    int head, tail;
+    int32_t n;
+} TaudSlidingMin;
+
+/* The look-ahead limiter: `nch` channels, channel-major, 2D deep each. */
+typedef struct {
+    int nch;
+    int d, dstride, dpos;
+    double *delay;
+    TaudSlidingMin min;
+    bool hasMin;
+    double *avg;
+    int avgLen;
+    double avgSum;
+    int apos;
+    double env, releaseCoef, ceiling;
+    bool truePeak;
+    TaudTruePeakProbe probes[TE_MAX_BUS_CH];
+    double tpCoef[TP_PHASES * TP_TAPS];
+    double grDb;
+} TaudLimiter;
+
+void te_lim_init(TaudLimiter *L, int nch);
+void te_lim_free(TaudLimiter *L);
+void te_lim_reset(TaudLimiter *L);
+bool te_lim_configure(TaudLimiter *L, double ceilingDb, bool truePeak, double releaseMs, double rate);
+void te_lim_step_planar(TaudLimiter *L, double *data, int n, int stride);
+
 void te_mastering_default(TaudMastering *p);
 bool te_mastering_engaged(const TaudMastering *p);
 bool te_mastering_parse_block(const uint8_t *b, size_t len, TaudMastering *out);
@@ -896,6 +985,88 @@ void te_master_chain_free(TaudMasterChain *c);
 void te_master_chain_set_params(TaudMasterChain *c, const TaudMastering *p);
 void te_master_chain_reset(TaudMasterChain *c);
 void te_master_chain_process(TaudMasterChain *c, float *left, float *right, int frames);
+
+/* ── instrument mixing chains (imix.js, imix-section.js) ───────────────── */
+
+/* The equipment, in pipeline-0 order; pipeline 1 swaps the delay and the
+ * reverb. The index is this port's; the file names each by its FourCC. */
+enum {
+    IMX_ITRM, IMX_EQU1, IMX_DEQ1, IMX_COMP, IMX_EQU2, IMX_DEQ2,
+    IMX_UNIS, IMX_SATU, IMX_DLAY, IMX_VERB, IMX_LIMI, IMX_MXTL, IMX_KINDS
+};
+#define IMX_EQ_MAX_BANDS 8
+#define IMX_COMP_MAX_BANDS 6
+#define IMX_DEQ_BANDS 6
+#define IMX_UNIS_MAX_VOICES 8
+
+typedef struct { int wave; bool retrigger, sync; uint32_t rate; float depth; } TaudImxLfoParams;
+typedef struct { bool on; int shape, slope; float freq, gainDb, q; } TaudImxEqBand;
+typedef struct { bool on; float threshDb, ratio, attackMs, releaseMs, kneeDb, makeupDb; } TaudImxCompBand;
+typedef struct {
+    bool on, unlinked, boost;
+    float freq, q, gainDb, senseFreq, senseQ, threshDb, ratio, attackMs, releaseMs, rangeDb, actorDb;
+} TaudImxDeqBand;
+
+/* One piece of equipment, normalised (normaliseEquipment): every float a
+ * binary32, every 16.16 quantity an integer. */
+typedef struct {
+    bool present, bypass;
+    int dry;                    /* 0 = all wet … 255 = all dry */
+    union {
+        struct { float gainDb; } trim;
+        struct { int n; TaudImxEqBand b[IMX_EQ_MAX_BANDS]; } eq;
+        struct { int detector, n; float xover[IMX_COMP_MAX_BANDS - 1]; TaudImxCompBand b[IMX_COMP_MAX_BANDS]; } comp;
+        struct { TaudImxDeqBand b[IMX_DEQ_BANDS]; } deq;
+        struct { int curve; float driveDb, inDb, outDb, bias; } sat;
+        struct { int voices; float detune, width, spacing; TaudImxLfoParams detuneLfo, widthLfo; } unis;
+        struct { float size, decay, damping; uint32_t preDelay; } verb;
+        struct { bool sync, pingPong; uint32_t time; float feedback, highCut, lowCut, wow, driveDb; } dlay;
+        struct { bool truePeak; float ceilingDb, releaseMs, gainDb; } lim;
+        struct { bool swap, invL, invR, removeDc; float gainDb, width; } mx;
+    } u;
+} TaudImxEquipment;
+
+/* One IMix block (§9.15): what playback reads of it. Equipment this reader
+ * does not know is skipped, as it is by the reference. */
+typedef struct {
+    int id;                     /* 1…255 */
+    bool enabled, bus;
+    int order;                  /* 0 or 1 */
+    TaudImxEquipment eq[IMX_KINDS];
+} TaudImixBlock;
+
+typedef struct TaudImxChain TaudImxChain;
+
+/* One bus on the playhead (InstrumentBus): a chunk of channel-major binary64
+ * in the song's own channel layout — `sb` is filled the way the master object
+ * bus is, through the same renderer gains — and the chain that runs over it.
+ * In bus mode `slots` lists every instrument sharing it, ascending. */
+typedef struct {
+    int slot;
+    int *slots;
+    int nSlots, capSlots;
+    int blockId;
+    uintptr_t renderer;         /* identity of the render target it was built for */
+    int nch;
+    bool stereo;
+    TaudSpatialBus sb;          /* sb.data is the bus; sb.numChannels = nch */
+    TaudImxChain *chain;
+    bool fed;
+} TaudImixBus;
+
+/* Slots a route table covers: the 1024 bank slots and the audition slot. */
+#define IMX_ROUTE_SLOTS NUM_INST_SLOTS
+
+/* imix.c */
+int te_imix_parse_section(const uint8_t *b, size_t len, TaudImixBlock **out);
+bool te_imix_block_engaged(const TaudImixBlock *b);
+TaudImxChain *te_imx_chain_new(const TaudImixBlock *block, int rate, int nch, bool stereo, bool ambisonic);
+void te_imx_chain_free(TaudImxChain *c);
+void te_imx_chain_set_block(TaudImxChain *c, const TaudImixBlock *block);
+void te_imx_chain_reset(TaudImxChain *c);
+void te_imx_chain_note_on(TaudImxChain *c);
+bool te_imx_chain_idle(const TaudImxChain *c);
+void te_imx_chain_process(TaudImxChain *c, double *data, int stride, int n0, int n1, int bpm, bool fed);
 
 /* ── the engine (engine.js + state.js Playhead/TrackerState) ───────────── */
 
@@ -957,6 +1128,7 @@ typedef struct TaudEngine {
     size_t samplePoolLen;
     TaudInst *instruments;      /* NUM_INST_SLOTS */
     TaudCell **playdata;        /* NUM_PATTERNS slots, lazily allocated */
+    TaudCell *sharedBlank[2];   /* the blank pattern every blank slot shares: narrow, wide */
     TaudCue *cueBlocks[CUE_BLOCKS];
     TaudCell emptyPattern[ROWS_PER_PATTERN];
     TaudCue emptyCue;
@@ -1031,6 +1203,20 @@ typedef struct TaudEngine {
     uint8_t psgNoiseMid[PSG_NOISE_MID_LEN];
     uint8_t psgNoiseShort[PSG_NOISE_SHORT_LEN];
 
+    /* Instrument mixing chains (item 217): the project's blocks by id
+     * (borrowed from the parsed document), and the playhead's route table —
+     * rebuilt whenever imixGen moves or the render target changes. */
+    const TaudImixBlock *imixBlocks[256];
+    unsigned imixGen, imixSyncedGen;
+    uintptr_t imixRenderer;
+    TaudImixBus *imixRoutes[IMX_ROUTE_SLOTS];
+    TaudImixBus **imixList;     /* ascending by slot */
+    int imixCount, imixCap;
+    uint8_t imixTrig[IMX_ROUTE_SLOTS];  /* a note started on the slot since its bus last ran */
+    /* The frame accumulators the buses join (mixAccL/R): a span's frames are
+     * finished only once every bus has run over it. */
+    double accL[TRACKER_CHUNK], accR[TRACKER_CHUNK];
+
     bool oom;                   /* an allocation failed on the render path */
 } TaudEngine;
 
@@ -1057,6 +1243,10 @@ void te_update_global_behaviour(TaudEngine *e, int flags);
 void te_set_surround_model(TaudEngine *e, int model);
 void te_set_monitor_mode(TaudEngine *e, int mode);
 void te_set_mastering(TaudEngine *e, const TaudMastering *params);
+void te_set_imix(TaudEngine *e, const TaudImixBlock *blocks, int count);
+void te_sync_imix_routes(TaudEngine *e);
+void te_imix_free_routes(TaudEngine *e);
+void te_imix_reset_chains(TaudEngine *e);
 void te_set_cue_position(TaudEngine *e, int pos);
 void te_reset_play_state(TaudEngine *e);
 void te_set_tracker_row(TaudEngine *e, int row);
@@ -1067,6 +1257,14 @@ void te_reset_sample_fx_state(TaudEngine *e);
 unsigned te_drain_interrupts(TaudEngine *e);
 bool te_render_chunk(TaudEngine *e);
 void te_pcm32f_to_pcm8(TaudEngine *e, uint8_t *out);
+/** The device's dither over any pair of buffers, its state passed in: the
+ *  engine's own, or a fresh one (seed TE_XORSHIFT_SEED, errors zero) for a
+ *  gritty WAV. */
+void te_dither_u8(uint32_t *xs, float err[4], const float *left, const float *right, size_t frames, uint8_t *out);
+/** One step of the dither's xorshift32 stream. */
+uint32_t te_xorshift32(uint32_t *state);
+/** The adapter's xorshift32 seed (AudioAdapter.kt; rng.js makeXorshift32). */
+#define TE_XORSHIFT_SEED 0x9e3779b9u
 
 /* Voice pool + background list. */
 TaudVoice *te_voice_alloc(TaudEngine *e);
@@ -1215,6 +1413,8 @@ void te_fm_referenced_operators(const uint16_t *program, int len, int count, uin
 void te_fm_seed_gains(TaudFmRig *rig, const TaudMeta *meta);
 double te_render_fm_voice(TaudEngine *e, TaudVoice *v, int interpMode, double spt, int64_t frame);
 void te_drop_fm_operators(TaudEngine *e, int vi);
+bool te_fm_principal_is_dsp(const uint16_t *program, int len);
+void te_fm_set_operator_vibrato(TaudFmRig *rig, int p, int s, int d);
 
 /* opl.c */
 extern const int32_t OPL_MULTIPLE_X2[16];
@@ -1380,6 +1580,8 @@ typedef struct {
     int numIxmp;
     TaudIxmpEntry *ixmp;        /* blobs point into projData */
     char *projectName;
+    int numImix;
+    TaudImixBlock *imix;        /* the IMix section's valid blocks, owned */
 } TaudDoc;
 
 TaudError te_parse_taud(const uint8_t *file, size_t len, TaudDoc *doc);

@@ -14,7 +14,7 @@ LDLIBS  += -lm
 
 SRCS = src/jsmath.c src/tables.c src/inst.c src/samplemod.c src/sampler.c src/envelope.c \
        src/filter.c src/fm.c src/opl.c src/psg.c src/formant.c src/spatial.c src/binaural.c src/hrir_sadie.c \
-       src/mastering.c src/trigger.c src/effects.c src/row.c src/tick.c \
+       src/mastering.c src/imix.c src/trigger.c src/effects.c src/row.c src/tick.c \
        src/mixer.c src/engine.c src/parse.c src/zstd.c src/inflate.c \
        src/resample.c src/player.c
 OBJS = $(SRCS:.c=.o)
@@ -45,9 +45,10 @@ JS ?= ../microtone-taudplay
 NODE ?= node
 export NODE
 NODE_POW := $(shell $(NODE) --no-use-std-math-pow -e 0 >/dev/null 2>&1 && echo --no-use-std-math-pow)
-check: all tests/compare tests/scenario tests/jsmath_check
+check: all tests/compare tests/scenario tests/jsmath_check tests/wavcheck
 	mkdir -p tests/out
 	$(NODE) $(NODE_POW) tests/jsmath_ref.mjs 200000 > tests/out/jsmath.bin && ./tests/jsmath_check tests/out/jsmath.bin
+	$(NODE) tests/wav_ref.mjs $(JS) tests/out/wav && ./tests/wavcheck tests/out/wav
 	JS=$(JS) sh tests/run.sh
 	JS=$(JS) sh tests/scenario.sh $(JS)/test/corpus/WHEN.taud 48000 0
 	JS=$(JS) sh tests/scenario.sh $(JS)/test/corpus/slumberjack.taud 44100 1
@@ -60,7 +61,7 @@ check: all tests/compare tests/scenario tests/jsmath_check
 	JS=$(JS) sh tests/scenario.sh tests/out/psg.taud 32000 0
 
 clean:
-	rm -f $(OBJS) libtaudplay.a taudplay tests/compare tests/scenario tests/robust tests/jsmath_check
+	rm -f $(OBJS) libtaudplay.a taudplay tests/compare tests/scenario tests/robust tests/jsmath_check tests/wavcheck
 	rm -rf tests/out
 
 .PHONY: all check clean robust
@@ -69,6 +70,9 @@ clean:
 robust: tests/robust.c $(SRCS)
 	$(CC) -std=c99 -g -O1 -ffp-contract=off -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	    -Iinclude -o tests/robust tests/robust.c $(SRCS) $(LDLIBS)
+
+tests/wavcheck: tests/wavcheck.c libtaudplay.a
+	$(CC) $(CFLAGS) -o $@ tests/wavcheck.c libtaudplay.a $(LDLIBS)
 
 tests/scenario: tests/scenario.c libtaudplay.a
 	$(CC) $(CFLAGS) -o $@ tests/scenario.c libtaudplay.a $(LDLIBS)

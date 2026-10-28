@@ -790,3 +790,173 @@ double js_fdlibm_pow(double x, double y)
     else z = with_hi(z, (uint32_t)j);
     return s * z;
 }
+
+/* ── log1p, expm1, tanh (V8 14.6 base/ieee754.cc, fdlibm's s_log1p.c,
+ *    s_expm1.c and s_tanh.c; tsvm reference_materials/v8-ieee754/) ── */
+
+double js_log1p(double x)
+{
+    static const double ln2_hi = 6.93147180369123816490e-01, ln2_lo = 1.90821492927058770002e-10,
+        Lp1 = 6.666666666666735130e-01, Lp2 = 3.999999999940941908e-01,
+        Lp3 = 2.857142874366239149e-01, Lp4 = 2.222219843214978396e-01,
+        Lp5 = 1.818357216161805012e-01, Lp6 = 1.531383769920937332e-01,
+        Lp7 = 1.479819860511658591e-01;
+    double hfsq, f = 0.0, c = 0.0, s, z, R, u;
+    int32_t k, hx = hi_word(x), hu = 0, ax = hx & 0x7fffffff;
+    k = 1;
+    if (hx < 0x3fda827a) {                  /* 1+x < sqrt(2)+ */
+        if (ax >= 0x3ff00000) {             /* x <= -1.0 */
+            if (x == -1.0) return -HUGE_VAL;
+            return NAN;
+        }
+        if (ax < 0x3e200000) {              /* |x| < 2**-29 */
+            if (two54 + x > 0.0 && ax < 0x3c900000) return x;
+            return x - x * x * 0.5;
+        }
+        if (hx > 0 || hx <= (int32_t)0xbfd2bec4) { k = 0; f = x; hu = 1; }
+    }
+    if (hx >= 0x7ff00000) return x + x;
+    if (k != 0) {
+        if (hx < 0x43400000) {
+            u = 1.0 + x;
+            hu = hi_word(u);
+            k = (hu >> 20) - 1023;
+            c = k > 0 ? 1.0 - (u - x) : x - (u - 1.0);
+            c /= u;
+        } else {
+            u = x;
+            hu = hi_word(u);
+            k = (hu >> 20) - 1023;
+            c = 0;
+        }
+        hu &= 0x000fffff;
+        if (hu < 0x6a09e) {
+            u = with_hi(u, (uint32_t)(hu | 0x3ff00000));
+        } else {
+            k += 1;
+            u = with_hi(u, (uint32_t)(hu | 0x3fe00000));
+            hu = (0x00100000 - hu) >> 2;
+        }
+        f = u - 1.0;
+    }
+    hfsq = 0.5 * f * f;
+    if (hu == 0) {                          /* |f| < 2**-20 */
+        if (f == 0.0) {
+            if (k == 0) return 0.0;
+            c += k * ln2_lo;
+            return k * ln2_hi + c;
+        }
+        R = hfsq * (1.0 - 0.66666666666666666 * f);
+        if (k == 0) return f - R;
+        return k * ln2_hi - ((R - (k * ln2_lo + c)) - f);
+    }
+    s = f / (2.0 + f);
+    z = s * s;
+    R = z * (Lp1 + z * (Lp2 + z * (Lp3 + z * (Lp4 + z * (Lp5 + z * (Lp6 + z * Lp7))))));
+    if (k == 0) return f - (hfsq - s * (hfsq + R));
+    return k * ln2_hi - ((hfsq - (s * (hfsq + R) + (k * ln2_lo + c))) - f);
+}
+
+double js_expm1(double x)
+{
+    static const double tiny = 1.0e-300, huge = 1.0e+300,
+        o_threshold = 7.09782712893383973096e+02,
+        ln2_hi = 6.93147180369123816490e-01, ln2_lo = 1.90821492927058770002e-10,
+        invln2 = 1.44269504088896338700e+00,
+        Q1 = -3.33333333333331316428e-02, Q2 = 1.58730158725481460165e-03,
+        Q3 = -7.93650757867487942473e-05, Q4 = 4.00821782732936239552e-06,
+        Q5 = -2.01099218183624371326e-07;
+    double y, hi, lo, c = 0.0, t, e, hxs, hfx, r1, twopk;
+    int32_t k, xsb;
+    uint32_t hx = (uint32_t)hi_word(x);
+    xsb = (int32_t)(hx & 0x80000000u);
+    hx &= 0x7fffffff;
+    if (hx >= 0x4043687a) {                 /* |x| >= 56*ln2 */
+        if (hx >= 0x40862e42) {             /* |x| >= 709.78... */
+            if (hx >= 0x7ff00000) {
+                if (((hx & 0xfffff) | lo_word(x)) != 0) return x + x;
+                return xsb == 0 ? x : -1.0;
+            }
+            if (x > o_threshold) return HUGE_VAL;
+        }
+        if (xsb != 0) {
+            if (x + tiny < 0.0) return tiny - 1.0;
+        }
+    }
+    if (hx > 0x3fd62e42) {                  /* |x| > 0.5 ln2 */
+        if (hx < 0x3ff0a2b2) {              /* and |x| < 1.5 ln2 */
+            if (xsb == 0) { hi = x - ln2_hi; lo = ln2_lo; k = 1; }
+            else { hi = x + ln2_hi; lo = -ln2_lo; k = -1; }
+        } else {
+            k = (int32_t)(invln2 * x + (xsb == 0 ? 0.5 : -0.5));
+            t = k;
+            hi = x - t * ln2_hi;
+            lo = t * ln2_lo;
+        }
+        x = hi - lo;
+        c = (hi - x) - lo;
+    } else if (hx < 0x3c900000) {           /* |x| < 2**-54: x */
+        t = huge + x;
+        return x - (t - (huge + x));
+    } else {
+        k = 0;
+    }
+    hfx = 0.5 * x;
+    hxs = x * hfx;
+    r1 = 1.0 + hxs * (Q1 + hxs * (Q2 + hxs * (Q3 + hxs * (Q4 + hxs * Q5))));
+    t = 3.0 - r1 * hfx;
+    e = hxs * ((r1 - t) / (6.0 - x * t));
+    if (k == 0) return x - (x * e - hxs);
+    twopk = from_words(0x3ff00000u + ((uint32_t)k << 20), 0);
+    e = (x * (e - c) - c);
+    e -= hxs;
+    if (k == -1) return 0.5 * (x - e) - 0.5;
+    if (k == 1) {
+        if (x < -0.25) return -2.0 * (e - (x + 0.5));
+        return 1.0 + 2.0 * (x - e);
+    }
+    if (k <= -2 || k > 56) {
+        y = 1.0 - (e - x);
+        if (k == 1024) y = y * 2.0 * 8.98846567431158e+307;
+        else y = y * twopk;
+        return y - 1.0;
+    }
+    t = 1.0;
+    if (k < 20) {
+        t = with_hi(t, (uint32_t)(0x3ff00000 - (0x200000 >> k)));    /* 1 - 2^-k */
+        y = t - (e - x);
+        y = y * twopk;
+    } else {
+        t = with_hi(t, (uint32_t)((0x3ff - k) << 20));               /* 2^-k */
+        y = x - (e + t);
+        y += 1.0;
+        y = y * twopk;
+    }
+    return y;
+}
+
+double js_tanh(double x)
+{
+    static const double tiny = 1.0e-300, huge = 1.0e300;
+    double t, z;
+    int32_t jx = hi_word(x), ix = jx & 0x7fffffff;
+    if (ix >= 0x7ff00000) {                 /* INF or NaN */
+        if (jx >= 0) return 1.0 / x + 1.0;
+        return 1.0 / x - 1.0;
+    }
+    if (ix < 0x40360000) {                  /* |x| < 22 */
+        if (ix < 0x3e300000) {              /* |x| < 2**-28 */
+            if (huge + x > 1.0) return x;
+        }
+        if (ix >= 0x3ff00000) {             /* |x| >= 1 */
+            t = js_expm1(2.0 * fabs(x));
+            z = 1.0 - 2.0 / (t + 2.0);
+        } else {
+            t = js_expm1(-2.0 * fabs(x));
+            z = -t / (t + 2.0);
+        }
+    } else {
+        z = 1.0 - tiny;
+    }
+    return jx >= 0 ? z : -z;
+}

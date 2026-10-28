@@ -152,7 +152,8 @@ const float *taud_render_chunk(TaudPlayer *p);
 size_t taud_render(TaudPlayer *p, float *out, size_t frames);
 
 /** Pull `frames` frames as interleaved stereo signed 16-bit, clamped and
- *  rounded exactly as the WAV writer does. Returns as taud_render. */
+ *  rounded (round(x × 32767), no dither — the clean WAV writer adds one).
+ *  Returns as taud_render. */
 size_t taud_render_s16(TaudPlayer *p, int16_t *out, size_t frames);
 
 /** Render one block as the Taud device does: noise-shaped, dithered unsigned
@@ -161,9 +162,20 @@ const uint8_t *taud_render_chunk_u8(TaudPlayer *p);
 
 /* ── utilities ────────────────────────────────────────────────────────────── */
 
-/** Encode interleaved stereo float at `src_rate` as a 16-bit stereo WAV at
- *  `dst_rate` (Kaiser-windowed-sinc resampled when they differ). Returns a
- *  malloc'd buffer the caller frees, with its size in `*out_len`. */
+/** How a WAV is quantised. CLEAN is 16-bit with a plain TPDF dither of one
+ *  LSB; GRITTY is 8-bit through the device's own noise-shaped dither, which at
+ *  the engine's rate is byte for byte what taud_render_chunk_u8 delivers. Both
+ *  dithers start afresh, so one input always makes one file. */
+typedef enum { TAUD_WAV_CLEAN = 0, TAUD_WAV_GRITTY = 1 } TaudWavQuality;
+
+/** Encode interleaved stereo float at `src_rate` as a stereo WAV at
+ *  `dst_rate` (Kaiser-windowed-sinc resampled when they differ), quantised as
+ *  `quality` says. Returns a malloc'd buffer the caller frees, with its size
+ *  in `*out_len`. Byte for byte the JS library's encodeWav. */
+uint8_t *taud_encode_wav_quality(const float *interleaved, size_t frames, int src_rate,
+                                 int dst_rate, TaudWavQuality quality, size_t *out_len);
+
+/** taud_encode_wav_quality with TAUD_WAV_CLEAN. */
 uint8_t *taud_encode_wav(const float *interleaved, size_t frames, int src_rate,
                          int dst_rate, size_t *out_len);
 

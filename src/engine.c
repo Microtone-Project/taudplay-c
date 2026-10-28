@@ -206,17 +206,36 @@ const TaudCell *te_pattern_read(const TaudEngine *e, int idx)
     return e->playdata[idx];
 }
 
+static bool is_shared_blank(const TaudEngine *e, const TaudCell *p)
+{
+    return p != NULL && (p == e->sharedBlank[0] || p == e->sharedBlank[1]);
+}
+
+static TaudCell *new_pattern(TaudEngine *e)
+{
+    TaudCell *p = (TaudCell *)calloc(ROWS_PER_PATTERN, sizeof *p);
+    int i;
+    if (p == NULL) { e->oom = true; return NULL; }
+    for (i = 0; i < ROWS_PER_PATTERN; i++) p[i].pan = 32;
+    return p;
+}
+
+/* Writable pattern idx, allocating its rows on first access — and copying
+ * the shared blank before anything is written over it. */
 static TaudCell *pattern_for(TaudEngine *e, int idx)
 {
     TaudCell *p;
-    int i;
     if (idx < 0 || idx >= NUM_PATTERNS) return NULL;
     p = e->playdata[idx];
     if (p == NULL) {
-        p = (TaudCell *)calloc(ROWS_PER_PATTERN, sizeof *p);
-        if (p == NULL) { e->oom = true; return NULL; }
-        for (i = 0; i < ROWS_PER_PATTERN; i++) p[i].pan = 32;
+        p = new_pattern(e);
+        if (p == NULL) return NULL;
         e->playdata[idx] = p;
+    } else if (is_shared_blank(e, p)) {
+        TaudCell *q = (TaudCell *)malloc(sizeof *q * ROWS_PER_PATTERN);
+        if (q == NULL) { e->oom = true; return NULL; }
+        memcpy(q, p, sizeof *q * ROWS_PER_PATTERN);
+        e->playdata[idx] = p = q;
     }
     return p;
 }
@@ -260,11 +279,9 @@ static void cell_set_byte_wide(TaudCell *c, int o, int b)
     }
 }
 
-void te_upload_pattern(TaudEngine *e, int slot, const uint8_t *bytes, size_t len)
+static void decode_pattern(const TaudEngine *e, TaudCell *pat, const uint8_t *bytes, size_t len)
 {
-    TaudCell *pat = pattern_for(e, slot & 0x7fff);
     size_t i, n;
-    if (pat == NULL) return;
     if (e->wideCells) {
         n = len < PATTERN_BYTES_WIDE ? len : PATTERN_BYTES_WIDE;
         for (i = 0; i < n; i++) cell_set_byte_wide(&pat[i / CELL_BYTES_WIDE], (int)(i % CELL_BYTES_WIDE), bytes[i]);
@@ -272,6 +289,61 @@ void te_upload_pattern(TaudEngine *e, int slot, const uint8_t *bytes, size_t len
     }
     n = len < PATTERN_BYTES ? len : PATTERN_BYTES;
     for (i = 0; i < n; i++) cell_set_byte(&pat[i / CELL_BYTES], (int)(i % CELL_BYTES), bytes[i]);
+}
+
+/* The no-op cell's bytes: both column selectors FINE by zero, everything else
+ * zero (file format §5.5). */
+static bool is_blank_pattern_bytes(const uint8_t *bytes, size_t len, bool wide)
+{
+    int size = wide ? CELL_BYTES_WIDE : CELL_BYTES;
+    size_t i;
+    if (len < (size_t)(64 * size)) return false;
+    for (i = 0; i < (size_t)(64 * size); i++) {
+        int k = (int)(i % size);
+        int want = wide ? (k == 8 ? 0x33 : 0) : (k == 3 || k == 4 ? 0xc0 : 0);
+        if (bytes[i] != want) return false;
+    }
+    return true;
+}
+
+/* The one copy every slot holding a blank pattern shares, one per cell
+ * format (blankPattern). Read-only: pattern_for copies it before a write. */
+static TaudCell *blank_pattern(TaudEngine *e)
+{
+    int k = e->wideCells ? 1 : 0;
+    if (e->sharedBlank[k] == NULL) {
+        uint8_t bytes[PATTERN_BYTES_WIDE];
+        int size = e->wideCells ? CELL_BYTES_WIDE : CELL_BYTES, r;
+        TaudCell *p = new_pattern(e);
+        if (p == NULL) return NULL;
+        memset(bytes, 0, sizeof bytes);
+        for (r = 0; r < 64; r++) {
+            if (e->wideCells) bytes[r * size + 8] = 0x33;
+            else { bytes[r * size + 3] = 0xc0; bytes[r * size + 4] = 0xc0; }
+        }
+        decode_pattern(e, p, bytes, (size_t)(64 * size));
+        e->sharedBlank[k] = p;
+    }
+    return e->sharedBlank[k];
+}
+
+/* A blank pattern is not stored but shared: a song renumbered lane by lane
+ * leaves thousands of them in the gaps between lanes. */
+void te_upload_pattern(TaudEngine *e, int slot, const uint8_t *bytes, size_t len)
+{
+    int idx = slot & 0x7fff;
+    TaudCell *pat;
+    if (idx < NUM_PATTERNS && is_blank_pattern_bytes(bytes, len, e->wideCells)) {
+        TaudCell *b = blank_pattern(e);
+        if (b != NULL) {
+            if (!is_shared_blank(e, e->playdata[idx])) free(e->playdata[idx]);
+            e->playdata[idx] = b;
+            return;
+        }
+    }
+    pat = pattern_for(e, idx);
+    if (pat == NULL) return;
+    decode_pattern(e, pat, bytes, len);
 }
 
 static TaudPlayInst decode_inst_word(int w)
@@ -365,6 +437,7 @@ void te_upload_sample_inst_blob(TaudEngine *e, const uint8_t *pool, size_t poolL
         e->instruments[i].extraPatches = NULL;
         e->instruments[i].patchCount = 0;
     }
+    e->imixGen++;   /* byte 255 of every record may have moved */
 }
 
 void te_upload_instrument_patches(TaudEngine *e, int slot, const uint8_t *bytes, size_t len)
@@ -423,6 +496,8 @@ static void apply_surround_model(TaudEngine *e)
     free(e->spatial);
     e->spatial = NULL;
     e->rendererGen++;
+    /* The instrument buses are in the song's channel layout, which just moved. */
+    e->imixGen++;
     if (model == SURROUND_STEREO) return;
     e->spatial = (TaudSpatialBus *)calloc(1, sizeof *e->spatial);
     if (e->spatial == NULL) { e->oom = true; e->ts_surroundModel = SURROUND_STEREO; return; }
@@ -506,6 +581,9 @@ void te_reset_play_state(TaudEngine *e)
     for (i = 0; i < MAX_VOICES; i++) e->voices[i].active = false;
     e->bgCount = 0;
     if (e->mastering != NULL) te_master_chain_reset(e->mastering);
+    /* …and the instruments' chains (item 217) for the same reason: a reverb
+     * tail or a delay line still holding the previous take is that take. */
+    te_imix_reset_chains(e);
 }
 
 void te_set_tracker_row(TaudEngine *e, int row)
@@ -655,7 +733,7 @@ TaudEngine *te_engine_new(int rate)
     e->pendingRowJump = -1;
     e->sexWinningChannel = -1;
 
-    e->xorshift = 0x9e3779b9u;
+    e->xorshift = TE_XORSHIFT_SEED;
     e->mulberry = 1;
     if (!pool_grow(e, POOL_CHUNK * 2)) { te_engine_free(e); return NULL; }
     return e;
@@ -671,9 +749,11 @@ void te_engine_free(TaudEngine *e)
         free(e->instruments);
     }
     if (e->playdata != NULL) {
-        for (i = 0; i < NUM_PATTERNS; i++) free(e->playdata[i]);
+        for (i = 0; i < NUM_PATTERNS; i++) if (!is_shared_blank(e, e->playdata[i])) free(e->playdata[i]);
         free(e->playdata);
     }
+    free(e->sharedBlank[0]);
+    free(e->sharedBlank[1]);
     for (i = 0; i < CUE_BLOCKS; i++) free(e->cueBlocks[i]);
     free(e->bg);
     c = e->chunks;
@@ -681,5 +761,6 @@ void te_engine_free(TaudEngine *e)
     free(e->spatial);
     te_binaural_free(e->binaural);
     te_master_chain_free(e->mastering);
+    te_imix_free_routes(e);
     free(e);
 }

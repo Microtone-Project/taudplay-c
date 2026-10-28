@@ -76,7 +76,8 @@ void audio_callback(void *user, float *out, int frames)
 ```
 
 `taud_render` buffers across block boundaries; `taud_render_s16` does the same
-into interleaved `int16_t` (clamped and rounded exactly as the WAV writer does).
+into interleaved `int16_t` (clamped and rounded, without the dither the clean
+WAV writer adds).
 `taud_render_chunk_u8` renders the Taud device's own output — noise-shaped,
 dithered unsigned 8-bit.
 
@@ -109,6 +110,11 @@ for (int v = 0; v < taud_channel_count(p); v++)   /* duck everything but the dru
 A fader reaches everything its lane spawned — NNA ghosts and metainstrument
 layers included — so a faded lane really does take its whole sound with it.
 
+A song's instrument mixing chains (`IMix`: per-instrument or group buses of
+trim, EQ, dynamic EQ, multiband compressor, unison, saturator, tape delay,
+reverb, limiter and mix tool) and its mastering chain (`sMst`) are installed
+from the file and played as the tracker plays them; there is nothing to set.
+
 ### Let the song call you
 
 ```c
@@ -137,6 +143,7 @@ The probes describe the state at the end of the last rendered block.
 ```
 taudplay song.taud                          describe the file
 taudplay song.taud -o song.wav              render song 0 to a 16-bit WAV
+taudplay song.taud --gritty -o song.wav     …or to the device's own 8-bit sound
 taudplay song.taud -s 2 -t 60 -o x.wav      song 2, at most 60 seconds
 taudplay song.taud -r 44100 -o x.wav        render natively at 44.1 kHz
 taudplay song.taud --wav-rate 44100 -o x.wav  render at 48 kHz, resample the WAV
@@ -171,8 +178,15 @@ All in [`include/taudplay.h`](include/taudplay.h).
 - **Interrupts:** `taud_set_interrupt`, `taud_clear_interrupts`
 - **Rendering:** `taud_render_chunk`, `taud_render`, `taud_render_s16`,
   `taud_render_chunk_u8`
-- **Utilities:** `taud_encode_wav` (with the library's Kaiser-sinc resampler),
-  `taud_gain_to_fader`, `taud_fader_to_gain`
+- **Utilities:** `taud_encode_wav_quality` (with the library's Kaiser-sinc
+  resampler) and `taud_encode_wav` (its clean case), `taud_gain_to_fader`,
+  `taud_fader_to_gain`
+
+A WAV comes in two qualities, the JS library's two. `TAUD_WAV_CLEAN` (the
+default) is 16-bit with a plain TPDF dither of one LSB; `TAUD_WAV_GRITTY` is
+8-bit through the device's own noise-shaped dither, so at the engine's rate it
+is byte for byte what `taud_render_chunk_u8` delivers. Each dither starts
+afresh, so the same floats always make the same file.
 
 ## Embedding notes
 
@@ -187,7 +201,14 @@ All in [`include/taudplay.h`](include/taudplay.h).
   an OPL channel, a PSG pair and a formant tract with a chip channel of its
   own for a source, so a sounding one never allocates). Peak memory
   during `taud_open` is about 11 MB, while the full image is decompressed.
-- **Allocation on the render path.** None in steady state. The voice pool grows
+  An instrument mixing chain adds its bus when its song loads: a few hundred
+  KB, or about 1.5 MB per channel of the bus when it holds a tape delay (four
+  seconds of binary64) — so a delay on a binaural render of a 3-D surround
+  song, sixteen channels wide, is about 25 MB. A blank pattern is stored once,
+  however many slots hold one.
+- **Allocation on the render path.** None in steady state; the instrument
+  buses are built at the first block after a song is selected or the monitor
+  mode changes. The voice pool grows
   (in blocks of 64 voices) only when a note storm outgrows every earlier one,
   and an instrument's invert/modification mask (8 KiB) is allocated the first
   time an effect needs it. Pools are reclaimed by marking what the lanes can
@@ -214,7 +235,8 @@ per frame, exactly where the JavaScript does; every expression keeps the
 reference's order of operations.
 
 V8 computes `Math.sin`, `cos`, `tan`, `exp`, `log`, `log10`, `log2`, `acos`,
-`asin`, `atan2` and `pow` (and `**`) with its own fdlibm port, and the C
+`asin`, `atan2`, `tanh`, `log1p`, `expm1` and `pow` (and `**`) with its own
+fdlibm port, and the C
 library's versions differ from it in the last bit for a few per cent of
 arguments — enough to move a sample by one binary32 ulp here and there. So
 [`src/jsmath.c`](src/jsmath.c) carries the fdlibm functions, verified
@@ -244,6 +266,8 @@ at the cost of the output's platform independence.
 where it has the flag, see [Numerics](#numerics)) runs:
 
 - `tests/jsmath_check` — the math functions against V8.
+- `tests/wavcheck` — the WAV encoder, clean and gritty, at the engine rate and
+  resampled, against the JS library's `encodeWav`, byte for byte.
 - `tests/run.sh` — every song of every corpus file, stereo fold-down and
   binaural, JS vs C, sample for sample. Also takes any files:
   `sh tests/run.sh path/to/*.taud`.
@@ -258,8 +282,13 @@ where it has the flag, see [Numerics](#numerics)) runs:
   operators among them, table kinds the engine does not know, OPL channels of
   every kind, PSG pairs of every waveform with their `S $Axxx` register writes,
   formant instruments with every consonant manner — syllabic, nasalised,
-  glottalised, sung from a sample or from a chip — every effect command,
-  mastering chains), and both implementations must render them identically.
+  glottalised, breathy, aspirated, sung from a sample or from a chip — FM
+  racks with DSP-only principals and programs filling their area to byte 253,
+  every effect command, mastering chains, and instrument mixing chains of
+  every piece, in both pipeline orders, separate and bus mode, with unknown
+  pieces and randomly corrupted blocks among them), and both implementations
+  must render them identically. `FUZZ_IMIX=1` puts chains in every song,
+  `FUZZ_IMIX=0` in none.
   `FUZZ_INSTS=opl`, `psg`, `formant` or `fm` narrows the patterns to one kind;
   `FUZZ_WILD=1` fills the OPL, PSG and formant blocks with random bytes.
 
@@ -276,9 +305,15 @@ from an audio callback, is `taud_render`. Source files mirror the JS modules one
 for one (`sampler.c` is `sampler.js`, `tick.c` is `tick.js`, `opl.c` is
 `opl.js`, `psg.c` is `psg.js`, `formant.c` is `formant.js`, …) and keep their
 function names, so the two can be diffed when the engine moves. (`chip.js`,
-which dispatches between the two chip kinds, is folded into `formant.c`.)
+which dispatches between the two chip kinds, is folded into `formant.c`;
+`imix.c` is `imix.js` and the decoder half of `imix-section.js`, and the
+biquad, compressor and limiter it shares with the master bus live in
+`mastering.c`, as they do in `mastering.js`. The JavaScript mixer runs a chunk
+in spans between ticks; this one runs a frame at a time and finishes each span
+— the instrument buses, the fold-down, the Amiga filters — just before the
+tick that ends it, which adds everything in the same order.)
 
-In step with taudplay 3.13.2 (Microtone.js 3.13.2, engine 63c8b5f8a219). The
+In step with taudplay 4.0.0 (Microtone.js 4.0.0, engine 83925c80dcf0). The
 engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
 `TaudRenderer` this library mirrors does not use it, and seeking here is
 `taud_seek_cue`, as it is there.

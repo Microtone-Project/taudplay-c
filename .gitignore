@@ -8,4 +8,5 @@ CLAUDE.md
 /tests/out/
 /tests/robust
 /tests/scenario
+/tests/wavcheck
 /tests/taudplay-final

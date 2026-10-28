@@ -388,11 +388,27 @@ size_t taud_render_s16(TaudPlayer *p, int16_t *out, size_t frames)
 static void wr16(uint8_t *b, unsigned v) { b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); }
 static void wr32(uint8_t *b, uint32_t v) { wr16(b, v & 0xffff); wr16(b + 2, v >> 16); }
 
-uint8_t *taud_encode_wav(const float *interleaved, size_t frames, int src_rate, int dst_rate, size_t *out_len)
+/* The clean WAV's 16-bit quantiser (dither.js in the JS library): clamp,
+ * scale by 32767, add a triangular -1…+1 LSB, round. The two draws are
+ * separate statements because C leaves the order of a - b's operands open. */
+static int16_t dither_s16(uint32_t *xs, float v)
+{
+    double d = v < -1.0f ? -1.0 : v > 1.0f ? 1.0 : (double)v;
+    double a = (double)(te_xorshift32(xs) & 0xffffff);
+    double b = (double)(te_xorshift32(xs) & 0xffffff);
+    double q = js_round(d * 32767 + (a - b) / 16777216.0);
+    return (int16_t)(q < -32768 ? -32768 : q > 32767 ? 32767 : q);
+}
+
+uint8_t *taud_encode_wav_quality(const float *interleaved, size_t frames, int src_rate, int dst_rate,
+                                 TaudWavQuality quality, size_t *out_len)
 {
     const float *pcm = interleaved;
     float *resampled = NULL;
+    const int gritty = quality == TAUD_WAV_GRITTY;
+    const unsigned bytesPer = gritty ? 1 : 2;
     size_t outFrames = frames, numSamples, dataBytes, i;
+    uint32_t xs = TE_XORSHIFT_SEED;
     uint8_t *buf;
     if (src_rate != dst_rate) {
         resampled = te_resample_interleaved(interleaved, frames, 2, src_rate, dst_rate, &outFrames);
@@ -400,7 +416,7 @@ uint8_t *taud_encode_wav(const float *interleaved, size_t frames, int src_rate, 
         pcm = resampled;
     }
     numSamples = outFrames * 2;
-    dataBytes = numSamples * 2;
+    dataBytes = numSamples * bytesPer;
     buf = (uint8_t *)malloc(44 + dataBytes);
     if (buf == NULL) { free(resampled); return NULL; }
     memcpy(buf, "RIFF", 4);
@@ -411,16 +427,33 @@ uint8_t *taud_encode_wav(const float *interleaved, size_t frames, int src_rate, 
     wr16(buf + 20, 1);
     wr16(buf + 22, 2);
     wr32(buf + 24, (uint32_t)dst_rate);
-    wr32(buf + 28, (uint32_t)dst_rate * 4);
-    wr16(buf + 32, 4);
-    wr16(buf + 34, 16);
+    wr32(buf + 28, (uint32_t)dst_rate * 2 * bytesPer);
+    wr16(buf + 32, 2 * bytesPer);
+    wr16(buf + 34, 8 * bytesPer);
     memcpy(buf + 36, "data", 4);
     wr32(buf + 40, (uint32_t)dataBytes);
-    for (i = 0; i < numSamples; i++) {
-        int16_t s = to_s16(pcm[i]);
-        wr16(buf + 44 + i * 2, (uint16_t)s);
+    if (gritty) {
+        /* The device's own dither, from a fresh state, a block at a time: at
+         * the engine's rate these are the bytes taud_render_chunk_u8 gives. */
+        float l[256], r[256], err[4] = { 0, 0, 0, 0 };
+        size_t f0, k;
+        for (f0 = 0; f0 < outFrames; f0 += 256) {
+            size_t n = outFrames - f0 < 256 ? outFrames - f0 : 256;
+            for (k = 0; k < n; k++) {
+                l[k] = pcm[(f0 + k) * 2];
+                r[k] = pcm[(f0 + k) * 2 + 1];
+            }
+            te_dither_u8(&xs, err, l, r, n, buf + 44 + f0 * 2);
+        }
+    } else {
+        for (i = 0; i < numSamples; i++) wr16(buf + 44 + i * 2, (uint16_t)dither_s16(&xs, pcm[i]));
     }
     free(resampled);
     *out_len = 44 + dataBytes;
     return buf;
+}
+
+uint8_t *taud_encode_wav(const float *interleaved, size_t frames, int src_rate, int dst_rate, size_t *out_len)
+{
+    return taud_encode_wav_quality(interleaved, frames, src_rate, dst_rate, TAUD_WAV_CLEAN, out_len);
 }

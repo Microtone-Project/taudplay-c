@@ -3,16 +3,17 @@
 #include <string.h>
 #include "../src/taud_internal.h"
 
-static const char *NAMES[] = { "sin", "cos", "tan", "exp", "log10", "log2", "acos", "asin", "atan2", "log", "pow" };
+static const char *NAMES[] = { "sin", "cos", "tan", "exp", "log10", "log2", "acos", "asin", "atan2", "log", "pow", "tanh", "log1p", "expm1" };
 int main(int argc, char **argv)
 {
     FILE *f = fopen(argc > 1 ? argv[1] : "tests/out/jsmath.bin", "rb");
     double r[4];
-    long total[11] = {0}, bad[11] = {0};
+    long total[14] = {0}, bad[14] = {0};
     int i, fail = 0;
     if (f == NULL) return 2;
     while (fread(r, 8, 4, f) == 4) {
         int id = (int)r[0];
+        if (id < 0 || id >= 14) continue;
         double v;
         switch (id) {
         case 0: v = js_sin(r[1]); break;
@@ -25,6 +26,9 @@ int main(int argc, char **argv)
         case 7: v = js_asin(r[1]); break;
         case 8: v = js_atan2(r[1], r[2]); break;
         case 9: v = js_log(r[1]); break;
+        case 11: v = js_tanh(r[1]); break;
+        case 12: v = js_log1p(r[1]); break;
+        case 13: v = js_expm1(r[1]); break;
         default: v = js_pow(r[1], r[2]); break;  /* whichever the engine uses */
         }
         total[id]++;
@@ -33,7 +37,7 @@ int main(int argc, char **argv)
             bad[id]++;
         }
     }
-    for (i = 0; i < 11; i++) {
+    for (i = 0; i < 14; i++) {
         printf("%-6s %9ld args, %ld mismatches\n", NAMES[i], total[i], bad[i]);
         if (bad[i]) fail = 1;
     }

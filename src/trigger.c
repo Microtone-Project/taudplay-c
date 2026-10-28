@@ -245,6 +245,9 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVa
     NotePanSeed seed;
 
     if (instId != 0) voice->displayInst = instId;
+    /* A note on an instrument with a mixing chain (item 217): its bus restarts
+     * the LFOs that retrigger on a note, at the top of the span this lands in. */
+    e->imixTrig[(voice->displayInst != 0 ? voice->displayInst : voice->instrumentId) & 0x3ff] = 1;
     release_layer_children(e, vi);
     te_drop_fm_operators(e, vi);
     inst = instId != 0 ? &e->instruments[instId] : &e->instruments[voice->instrumentId];

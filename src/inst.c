@@ -238,7 +238,7 @@ static bool decode_fm_program(const uint8_t *b, int off, int opCount, TaudMeta *
 {
     int o, depth = 0, n = 0;
     bool ended = false;
-    for (o = off; o + 2 <= 256; o += 2) {
+    for (o = off; o + 2 <= FM_PROGRAM_END; o += 2) {
         int w = b[o] | (b[o + 1] << 8);
         Arity a;
         if (w == FMOP_END) { ended = true; break; }
@@ -248,7 +248,9 @@ static bool decode_fm_program(const uint8_t *b, int off, int opCount, TaudMeta *
         if (depth > FM_STACK_MAX) return false;
         m->program[n++] = (uint16_t)w;
     }
-    if (!ended && off + n * 2 + 2 <= 256) return false;
+    /* A program that fills its area to the last byte ends there; one that
+     * stops early must say so. */
+    if (!ended && off + n * 2 + 2 <= FM_PROGRAM_END) return false;
     if (depth < 1) return false;
     m->programLen = n;
     return true;
@@ -461,7 +463,10 @@ void te_inst_load_record(TaudInst *inst, const uint8_t *b)
         inst->meta = NULL;
         if (m.count > 0) {
             m.flags = b[0];
-            m.strict = (b[0] & 0x01) != 0;
+            /* Bit 0 is strict layering in a Layered record only; in a rack it
+             * is the editor's Easy Mode mark (§7.7), which the engine does not read. */
+            m.strict = !fm && (b[0] & 0x01) != 0;
+            m.imixId = b[255];
             m.type = type;
             m.hasProgram = fm ? decode_fm_program(b, o, m.count, &m) : false;
             inst->meta = (TaudMeta *)malloc(sizeof m);

@@ -23,6 +23,9 @@ const gens = [
     if (r < 0.8) return [-u(0, 10), Math.round(u(-20, 20))];
     return [Math.exp(u(-300, 300)), u(-2, 2)];
   }, (a, b) => a ** b],
+  ["tanh", () => [rnd() < 0.5 ? u(-3, 3) : u(-40, 40)], (a) => Math.tanh(a)],
+  ["log1p", () => [rnd() < 0.5 ? u(-1, 1) : Math.exp(u(-60, 700)) - (rnd() < 0.2 ? 1 : 0)], (a) => Math.log1p(a)],
+  ["expm1", () => [rnd() < 0.5 ? u(-2, 2) : u(-745, 709)], (a) => Math.expm1(a)],
 ];
 const rec = new Float64Array(4);
 const buf = Buffer.alloc(N * gens.length * 32);

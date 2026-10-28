@@ -384,6 +384,13 @@ static void apply_s_effect(TaudEngine *e, TaudVoice *voice, int vi, int arg)
         break;
     }
     case 0xa:
+        /* S $Apsd — on an FM rack (§5.5.1), operator p's auto-vibrato: speed
+         * s × 17, depth d × 17, for this note. The rack takes the command
+         * whole, so a PSG operator inside it takes no register write. */
+        if (voice->fmRig != NULL) {
+            te_fm_set_operator_vibrato(voice->fmRig, x, (arg >> 4) & 0xf, arg & 0xf);
+            break;
+        }
         /* S $Afgr — on a voice sounding a formant instrument (item 212), the
          * vowel: openness f, frontness g, roundness r. The note's whole tract
          * hears it, layer children included.

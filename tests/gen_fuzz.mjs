@@ -5,7 +5,7 @@
 // (stereo included), layered and FM metainstruments (chip operators
 // included), OPL, PSG and formant instruments (sung from a sample or from a
 // chip), table kinds the engine does not know, sample modifications,
-// interrupts and mastering.
+// interrupts, mastering and instrument mixing chains (IMix, valid and not).
 //
 //   node tests/gen_fuzz.mjs <microtone-taudplay> SEED OUT.taud
 //
@@ -17,6 +17,7 @@ import { resolve } from "node:path";
 
 const [root, seedArg, out] = process.argv.slice(2);
 const { gzipSync } = await import(pathToFileURL(resolve(root, "core/vendor/fflate.esm.js")).href);
+const IMX = await import(pathToFileURL(resolve(root, "core/format/imix-section.js")).href);
 
 let seed = (+seedArg >>> 0) || 1;
 const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
@@ -198,7 +199,8 @@ for (let idx = 70; idx < 76; idx++) {
 
 // Formant instruments (type 1): a source, a vowel, consonant slots, a glide.
 const CONS_IDS = [0, 0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 13, 14, 15, 16, 32, 34, 37, 40, 41, 44, 45, 48, 49, 50, 51,
-  52, 54, 55, 56, 58, 60, 62, 64, 66, 67, 68, 69, 70, 72, 74, 80, 81, 83, 85, 86, 88, 90, 96, 98, 100, 104, 105, 200];
+  52, 54, 55, 56, 58, 60, 62, 64, 66, 67, 68, 69, 70, 72, 74, 80, 81, 83, 85, 86, 88, 90, 96, 98, 100, 104, 105, 200,
+  17, 18, 19, 20, 21, 75, 106, 107, 108, 109, 110, 111, 111];
 const formantInsts = [];
 for (let idx = 60; idx < 68; idx++) {
   const b = rec(idx);
@@ -247,6 +249,7 @@ for (let idx = 60; idx < 68; idx++) {
 }
 
 // Layered metainstruments (type 0) and FM racks (type 4).
+// (An FM rack's bit 0 is the editor's Easy Mode mark, not strict layering.)
 function metaRecord(idx, type, layers, program, strict) {
   const b = rec(idx);
   b.fill(0);
@@ -264,8 +267,9 @@ function metaRecord(idx, type, layers, program, strict) {
     o += 10;
   }
   if (program) {
-    for (const w of program) { w16(b, o, w); o += 2; }
-    w16(b, o, 0xffff);
+    // The program area ends at byte 253: byte 255 is the record's IMix id.
+    for (const w of program) { if (o + 2 > 254) break; w16(b, o, w); o += 2; }
+    if (o + 2 <= 254) w16(b, o, 0xffff);
   }
 }
 for (let idx = 30; idx < 34; idx++) {
@@ -296,8 +300,26 @@ for (let idx = 40; idx < 43; idx++) {
     [1, 0x0400 | 0, 0, 0xff00],
     [1, 0xff03, 0x0400 | 0, 0xff01],
     [nOps - 1, 0xff02, 0x0400 | 0],
+    // A DSP-only principal (Easy Mode's layout): S $Apsd counts past it.
+    [1, 0x0000, 0xff01],
+    [1, 2, 0xff00, 0x0000, 0xff01],
   ];
-  metaRecord(idx, 4, ops, pick(progs).map((w) => (w & 0xff00) === 0xff00 ? w : (w & ~0x3ff) | Math.min(w & 0x3ff, nOps - 1)), false);
+  metaRecord(idx, 4, ops, pick(progs).map((w) => (w & 0xff00) === 0xff00 ? w : (w & ~0x3ff) | Math.min(w & 0x3ff, nOps - 1)), chance(0.5));
+}
+// A full rack: sixteen operators and a program that runs to byte 253 with no
+// END — the area's last word — or one word short of it.
+{
+  const ops = [];
+  for (let k = 0; k < 16; k++) {
+    ops.push({ inst: pick(sampleInsts.slice(0, 6)), mix: ri(60, 120), detune: ri(-300, 3000),
+      ps: 0, pe: 0xffff, vs: 0, ve: 63, fixed: false });
+  }
+  // 16 × 10 bytes of rack leave bytes 164…253: 45 words. Either all 45 (no
+  // END: the area's end ends it) or 44 and END in the area's last word.
+  const prog = [1];
+  for (let k = 0; k < 21; k++) prog.push(2 + (k % 14), 0xff00);
+  prog.push(chance(0.5) ? 0xff03 : 15, ...(chance(0.5) ? [0xff00] : []));
+  metaRecord(43, 4, ops, prog, chance(0.5));
 }
 // Tables of kinds the engine has no reading for (types 2, 3, 5, 7, 10…15):
 // the Layered shape, sounding nothing.
@@ -405,9 +427,97 @@ if (process.env.FUZZ_WILD) {
 const instChoices = process.env.FUZZ_INSTS === "opl" ? oplInsts
   : process.env.FUZZ_INSTS === "psg" ? psgInsts
   : process.env.FUZZ_INSTS === "formant" ? formantInsts
-  : process.env.FUZZ_INSTS === "fm" ? [40, 41, 42]
-  : [...sampleInsts, 30, 31, 32, 33, 34, 35, 40, 41, 42, ...oplInsts, ...oplInsts, ...psgInsts, ...psgInsts,
+  : process.env.FUZZ_INSTS === "fm" ? [40, 41, 42, 43]
+  : [...sampleInsts, 30, 31, 32, 33, 34, 35, 40, 41, 42, 43, ...oplInsts, ...oplInsts, ...psgInsts, ...psgInsts,
     ...formantInsts, ...formantInsts];
+
+// ── instrument mixing chains (IMix) ──
+// FUZZ_IMIX=0 leaves them out. Blocks are encoded by the JS library's own
+// codec, then now and then corrupted, so both readers' strictness is tested
+// too: a contradiction drops the block, an out-of-range value is clamped.
+const imixSection = [];
+if (process.env.FUZZ_IMIX !== "0" && chance(process.env.FUZZ_IMIX ? 1 : 0.7)) {
+  const f = (lo, hi) => lo + (hi - lo) * rnd();
+  const lfo = () => {
+    const sync = chance(0.4);
+    return { wave: ri(0, 5), retrigger: chance(0.5), sync, rate: sync ? ri(1 << 16, 64 << 16) : ri(655, 12 << 16), depth: rnd() };
+  };
+  const eqBand = () => {
+    const shape = ri(0, 5);
+    return { on: chance(0.85), shape, slope: shape === 0 || shape === 4 ? ri(0, 3) : 0,
+      freq: f(25, 18000), gainDb: f(-18, 18), q: f(0.2, 8) };
+  };
+  const compBand = () => ({ on: chance(0.85), threshDb: f(-45, -3), ratio: f(1, 12), attackMs: f(0.2, 80),
+    releaseMs: f(10, 600), kneeDb: f(0, 12), makeupDb: f(-3, 9) });
+  const deqBand = () => {
+    const freq = f(40, 12000), q = f(0.3, 6), unlinked = chance(0.4);
+    return { on: chance(0.6), unlinked, boost: chance(0.3), freq, q, gainDb: f(-9, 9),
+      senseFreq: unlinked ? f(40, 12000) : freq, senseQ: unlinked ? f(0.3, 6) : q,
+      threshDb: f(-50, -5), ratio: f(1.2, 10), attackMs: f(0.5, 50), releaseMs: f(10, 400),
+      rangeDb: f(0, 18), actorDb: f(-12, 12) };
+  };
+  const gen = {
+    itrm: () => ({ gainDb: f(-12, 12) }),
+    equ1: () => ({ bands: Array.from({ length: ri(0, 8) }, eqBand) }),
+    deq1: () => ({ bands: Array.from({ length: 6 }, deqBand) }),
+    comp: () => {
+      const n = ri(1, 6);
+      const xs = [];
+      let x = 60;
+      for (let i = 1; i < n; i++) { x *= f(1.6, 4); xs.push(x); }
+      return { detector: ri(0, 1), crossovers: xs, bands: Array.from({ length: n }, compBand) };
+    },
+    satu: () => ({ curve: ri(0, 4), driveDb: f(0, 24), inDb: f(-6, 6), outDb: f(-12, 3), bias: chance(0.5) ? 0 : f(-0.6, 0.6) }),
+    unis: () => ({ voices: ri(2, 8), detune: f(0, 60), width: rnd(), spacing: chance(0.5) ? 0 : rnd(),
+      detuneLfo: lfo(), widthLfo: lfo() }),
+    verb: () => ({ size: rnd(), decay: f(0.2, 6), damping: f(1500, 18000), preDelay: ri(0, 20000) }),
+    dlay: () => {
+      const sync = chance(0.5);
+      return { sync, pingPong: chance(0.5), time: sync ? ri(1 << 14, 96 << 16) : ri(66, 1 << 16),
+        feedback: f(0, 1.1), highCut: f(800, 18000), lowCut: f(30, 900), wow: chance(0.3) ? 0 : rnd(), driveDb: f(0, 18) };
+    },
+    limi: () => ({ truePeak: chance(0.5), ceilingDb: f(-18, 0), releaseMs: f(5, 400), gainDb: f(-6, 12) }),
+    mxtl: () => ({ swap: chance(0.3), invL: chance(0.3), invR: chance(0.3), removeDc: chance(0.5),
+      gainDb: f(-9, 9), width: chance(0.4) ? 1 : f(0, 2) }),
+  };
+  gen.equ2 = gen.equ1;
+  gen.deq2 = gen.deq1;
+  const KINDS = Object.keys(gen);
+  const ids = [];
+  const nBlocks = ri(1, 4);
+  for (let k = 0; k < nBlocks; k++) {
+    const id = chance(0.1) && ids.length ? pick(ids) : ri(1, 12);   // now and then an id twice
+    ids.push(id);
+    const equipment = {};
+    const nEq = chance(0.15) ? 0 : ri(1, 5);
+    for (let q = 0; q < nEq; q++) {
+      const kind = pick(KINDS);
+      equipment[kind] = { bypass: chance(0.1), folded: chance(0.2), dry: chance(0.5) ? 0 : ri(0, 255), ...gen[kind]() };
+    }
+    const unknown = chance(0.15) ? [{ fourcc: pick(["zzzz", "Xtra"]), bytes: Uint8Array.from({ length: ri(4, 20) }, () => ri(0, 255)) }] : [];
+    let bytes = IMX.buildImixBlock({ id, enabled: chance(0.9), bus: chance(0.35), order: ri(0, 1), equipment, unknown });
+    if (chance(0.06) && bytes.length > 12) {
+      // A known piece declared at a version this reader does not know.
+      bytes = Uint8Array.from(bytes);
+      bytes[4 + 4 * bytes[3] + 8] |= ri(1, 15);
+    }
+    if (chance(0.12)) {
+      bytes = Uint8Array.from(bytes);
+      const n = ri(1, 3);
+      for (let i = 0; i < n; i++) {
+        const at = ri(0, bytes.length - 1);
+        bytes[at] = chance(0.5) ? ri(0, 255) : bytes[at] ^ (1 << ri(0, 7));
+      }
+    }
+    imixSection.push(...bytes);
+  }
+  if (chance(0.05)) imixSection.push(...Array.from({ length: ri(1, 6) }, () => ri(0, 255)));  // trailing junk
+  // Byte 255 of the records: the block, one no block has, or none.
+  const targets = [...sampleInsts, 30, 31, 32, 33, 34, 35, 40, 41, 42, 43, ...oplInsts, ...psgInsts, ...formantInsts];
+  for (const idx of targets) {
+    if (chance(0.45)) rec(idx)[255] = chance(0.9) ? pick(ids) : ri(13, 255);
+  }
+}
 function makePattern() {
   const p = new Uint8Array(ROWS * cellBytes);
   for (let r = 0; r < ROWS; r++) {
@@ -546,6 +656,7 @@ if (chance(0.6)) {
   payload[0] = 0; w32(payload, 1, 160); payload.set(blk, 5);
   sec("sMst", payload);
 }
+if (imixSection.length) sec("IMix", Uint8Array.from(imixSection));
 const projHeader = new Uint8Array(16);
 projHeader.set([0x1e, 0x54, 0x61, 0x75, 0x64, 0x50, 0x72, 0x4a]);
 const projOff = off;

@@ -182,6 +182,35 @@ double te_render_fm_voice(TaudEngine *e, TaudVoice *voice, int interpMode, doubl
     return sp > 0 ? stack[sp - 1] : 0.0;
 }
 
+/* True when operator 0 is a DSP-ONLY principal (fmPrincipalIsDsp): the
+ * program ends by multiplying everything above it by operator 0 (`$0000
+ * $FF01`) and names it nowhere else — the layout an editor's Easy Mode
+ * writes, and what `S $Apsd` counts its operators past (§5.5.1). */
+bool te_fm_principal_is_dsp(const uint16_t *program, int len)
+{
+    int i;
+    if (program == NULL || len < 3 || program[len - 1] != FMOP_MUL || program[len - 2] != FM_WORD_OSC) return false;
+    for (i = 0; i < len - 2; i++) {
+        int w = program[i];
+        if (w < FM_WORD_OP && (w & FM_INDEX_MASK) == 0) return false;
+    }
+    return true;
+}
+
+/* S $Apsd on a rack (fmSetOperatorVibrato): operator p's auto-vibrato speed
+ * and depth, s × 17 and d × 17, for the note now sounding. p counts the
+ * oscillators — from entry 1 when the principal is DSP-only, else from 0. An
+ * operator that is not sounding this note, or past the rack's end, takes
+ * nothing. */
+void te_fm_set_operator_vibrato(TaudFmRig *rig, int p, int s, int d)
+{
+    int k = te_fm_principal_is_dsp(rig->program, rig->programLen) ? p + 1 : p;
+    TaudVoice *v = k < rig->count ? rig->voices[k] : NULL;
+    if (v == NULL) return;
+    v->activeVibratoSpeed = s * 17;
+    v->activeVibratoDepth = d * 17;
+}
+
 /* Detach and silence every operator the foreground voice of lane `vi` drives. */
 void te_drop_fm_operators(TaudEngine *e, int vi)
 {
