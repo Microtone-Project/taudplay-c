@@ -111,8 +111,8 @@ A fader reaches everything its lane spawned — NNA ghosts and metainstrument
 layers included — so a faded lane really does take its whole sound with it.
 
 A song's instrument mixing chains (`IMix`: per-instrument or group buses of
-trim, EQ, dynamic EQ, multiband compressor, unison, saturator, tape delay,
-reverb, limiter and mix tool) and its mastering chain (`sMst`) are installed
+trim, expander/gate, EQ, dynamic EQ, multiband transient shaper, multiband
+compressor, unison, saturator, tape delay, reverb, limiter and mix tool) and its mastering chain (`sMst`) are installed
 from the file and played as the tracker plays them; there is nothing to set.
 
 ### Let the song call you
@@ -288,7 +288,8 @@ where it has the flag, see [Numerics](#numerics)) runs:
   every piece, in both pipeline orders, separate and bus mode, with unknown
   pieces and randomly corrupted blocks among them), and both implementations
   must render them identically. `FUZZ_IMIX=1` puts chains in every song,
-  `FUZZ_IMIX=0` in none.
+  `FUZZ_IMIX=0` in none, and `FUZZ_IMIX_KINDS=tsh1,expd` (any FourCCs) draws
+  their equipment from those pieces alone.
   `FUZZ_INSTS=opl`, `psg`, `formant` or `fm` narrows the patterns to one kind;
   `FUZZ_WILD=1` fills the OPL, PSG and formant blocks with random bytes.
 
@@ -308,12 +309,15 @@ function names, so the two can be diffed when the engine moves. (`chip.js`,
 which dispatches between the two chip kinds, is folded into `formant.c`;
 `imix.c` is `imix.js` and the decoder half of `imix-section.js`, and the
 biquad, compressor and limiter it shares with the master bus live in
-`mastering.c`, as they do in `mastering.js`. The JavaScript mixer runs a chunk
+`mastering.c`, as they do in `mastering.js`; the multiband split the
+compressor and the transient shaper share is `ImxSplit`, and the windowed peak
+the shaper and the expander detect with is `ImxPeakWin`, both as in `imix.js`.
+The JavaScript mixer runs a chunk
 in spans between ticks; this one runs a frame at a time and finishes each span
 — the instrument buses, the fold-down, the Amiga filters — just before the
 tick that ends it, which adds everything in the same order.)
 
-In step with taudplay 4.0.0 (Microtone.js 4.0.0, engine 83925c80dcf0). The
+In step with taudplay 4.1.0 (Microtone.js 4.1.0, engine 3131d0f7d915). The
 engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
 `TaudRenderer` this library mirrors does not use it, and seeking here is
 `taud_seek_cue`, as it is there.

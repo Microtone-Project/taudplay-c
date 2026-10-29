@@ -10,8 +10,8 @@
  * nothing that is not bypassed, makes no bus at all: the plain path, to the
  * bit.
  *
- *   order 0: itrm → equ1 → deq1 → comp → equ2 → deq2 → unis → satu → dlay → verb → limi → mxtl
- *   order 1: itrm → equ1 → deq1 → comp → equ2 → deq2 → unis → satu → verb → dlay → limi → mxtl
+ *   order 0: itrm → expd → equ1 → deq1 → tsh1 → comp → equ2 → deq2 → unis → satu → dlay → verb → limi → mxtl
+ *   order 1: itrm → expd → equ1 → deq1 → tsh1 → comp → equ2 → deq2 → unis → satu → verb → dlay → limi → mxtl
  *
  * Everything that accumulates (an LFO's phase, a pitch shifter's sweep, a tape
  * delay's glide, its wow and flutter) is integer arithmetic on 16.16
@@ -40,6 +40,9 @@
 #define IMX_IDLE_MARGIN_SEC 0.05
 #define IMX_DC_HZ 3.0
 #define IMX_DC_K 6.3
+#define IMX_TSH_WINDOW_SEC 0.025
+#define IMX_TSH_SMOOTH_MS 1
+#define IMX_EXPD_WINDOW_SEC 0.025
 
 /* Equaliser band shapes. */
 #define EQ_HIGH_PASS 0
@@ -70,18 +73,21 @@
 #define DEQ_HIGH_SHELF_BAND 1
 
 static const char FOURCC[IMX_KINDS][5] = {
-    "itrm", "equ1", "deq1", "comp", "equ2", "deq2", "unis", "satu", "dlay", "verb", "limi", "mxtl"
+    "itrm", "expd", "equ1", "deq1", "tsh1", "comp", "equ2", "deq2", "unis", "satu", "dlay", "verb", "limi", "mxtl"
 };
 
 static const int PIPELINES[2][IMX_KINDS] = {
-    { IMX_ITRM, IMX_EQU1, IMX_DEQ1, IMX_COMP, IMX_EQU2, IMX_DEQ2, IMX_UNIS, IMX_SATU, IMX_DLAY, IMX_VERB, IMX_LIMI, IMX_MXTL },
-    { IMX_ITRM, IMX_EQU1, IMX_DEQ1, IMX_COMP, IMX_EQU2, IMX_DEQ2, IMX_UNIS, IMX_SATU, IMX_VERB, IMX_DLAY, IMX_LIMI, IMX_MXTL },
+    { IMX_ITRM, IMX_EXPD, IMX_EQU1, IMX_DEQ1, IMX_TSH1, IMX_COMP, IMX_EQU2, IMX_DEQ2,
+      IMX_UNIS, IMX_SATU, IMX_DLAY, IMX_VERB, IMX_LIMI, IMX_MXTL },
+    { IMX_ITRM, IMX_EXPD, IMX_EQU1, IMX_DEQ1, IMX_TSH1, IMX_COMP, IMX_EQU2, IMX_DEQ2,
+      IMX_UNIS, IMX_SATU, IMX_VERB, IMX_DLAY, IMX_LIMI, IMX_MXTL },
 };
 
 /* Equipment whose wet/dry byte means something; everything else must carry 0. */
 static bool wet_applicable(int k)
 {
-    return k == IMX_COMP || k == IMX_UNIS || k == IMX_SATU || k == IMX_DLAY || k == IMX_VERB;
+    return k == IMX_EXPD || k == IMX_TSH1 || k == IMX_COMP || k == IMX_UNIS || k == IMX_SATU || k == IMX_DLAY
+        || k == IMX_VERB;
 }
 
 static bool is_cut_shape(int shape) { return shape == EQ_HIGH_PASS || shape == EQ_LOW_PASS; }
@@ -143,7 +149,7 @@ static const double DEQ_DEFAULT_FREQS[IMX_DEQ_BANDS] = { 100, 8000, 250, 1000, 3
  * normaliseEquipment); false on a contradiction. */
 static bool decode_equipment(int k, const uint8_t *p, size_t len, TaudImxEquipment *e)
 {
-    static const size_t FIXED[IMX_KINDS] = { 8, 0, 296, 0, 0, 296, 44, 24, 32, 24, 20, 16 };
+    static const size_t FIXED[IMX_KINDS] = { 8, 48, 0, 296, 0, 0, 0, 296, 44, 24, 32, 24, 20, 16 };
     int i;
     if (FIXED[k] != 0 && len != FIXED[k]) return false;
     if (!wet_applicable(k) && p[1] != 0) return false;
@@ -155,6 +161,63 @@ static bool decode_equipment(int k, const uint8_t *p, size_t len, TaudImxEquipme
     case IMX_ITRM:
         e->u.trim.gainDb = clampf(rd_f32(p + 4), -24, 24, 0);
         return true;
+    case IMX_EXPD: {
+        double floorRaw = rd_f32(p + 12);
+        if (p[5] > 1) return false;
+        /* A floor above the threshold says the sound is shut where it should pass. */
+        if (floorRaw > rd_f32(p + 8)) return false;
+        e->u.expd.keyFilter = (p[4] & 1) != 0;
+        e->u.expd.detector = p[5] == COMP_RMS ? COMP_RMS : COMP_PEAK;
+        e->u.expd.threshDb = clampf(rd_f32(p + 8), -80, 0, -50);
+        /* No floor is −∞ (a pure expander); one above the threshold, once
+         * clamped, is brought down to it. */
+        if (isnan(floorRaw) || floorRaw == -INFINITY) e->u.expd.floorDb = -INFINITY;
+        else {
+            float f = clampf(floorRaw, -80, 0, e->u.expd.threshDb);
+            e->u.expd.floorDb = f < e->u.expd.threshDb ? f : e->u.expd.threshDb;
+        }
+        e->u.expd.ratio = clampf(rd_f32(p + 16), 1, 20, 2);
+        e->u.expd.rangeDb = clampf(rd_f32(p + 20), 0, 80, 24);
+        e->u.expd.attackMs = clampf(rd_f32(p + 24), 0.1, 300, 1);
+        e->u.expd.holdMs = clampf(rd_f32(p + 28), 0, 2000, 20);
+        e->u.expd.releaseMs = clampf(rd_f32(p + 32), 5, 3000, 150);
+        e->u.expd.hysteresisDb = clampf(rd_f32(p + 36), 0, 12, 4);
+        e->u.expd.keyLowCut = clampf(rd_f32(p + 40), 20, 2000, 80);
+        e->u.expd.keyHighCut = clampf(rd_f32(p + 44), 500, 20000, 12000);
+        return true;
+    }
+    case IMX_TSH1: {
+        int n;
+        bool ok = true;
+        double prev = 0;
+        if (len < 8) return false;
+        n = p[4];
+        if (n < 1 || n > IMX_TSH_MAX_BANDS) return false;
+        if (len != (size_t)(8 + 4 * (n - 1) + 24 * n)) return false;
+        for (i = 0; i < n - 1; i++) {
+            double x = rd_f32(p + 8 + 4 * i);
+            if (i > 0 && !(x > prev)) return false;
+            prev = x;
+        }
+        e->u.tsh.n = n;
+        for (i = 0; i < n; i++) {
+            const uint8_t *o = p + 8 + 4 * (n - 1) + i * 24;
+            TaudImxTshBand *b = &e->u.tsh.b[i];
+            b->on = (o[0] & 1) != 0;
+            b->attackDb = clampf(rd_f32(o + 4), -24, 24, 0);
+            b->sustainDb = clampf(rd_f32(o + 8), -24, 24, 0);
+            b->attackMs = clampf(rd_f32(o + 12), 1, 300, 20);
+            b->releaseMs = clampf(rd_f32(o + 16), 10, 3000, 250);
+            b->outDb = clampf(rd_f32(o + 20), -24, 24, 0);
+        }
+        /* n − 1 crossovers, strictly ascending once clamped, or re-spread. */
+        for (i = 0; i < n - 1; i++) {
+            e->u.tsh.xover[i] = clampf(rd_f32(p + 8 + 4 * i), 20, 20000, 1000);
+            if (i > 0 && !(e->u.tsh.xover[i] > e->u.tsh.xover[i - 1])) ok = false;
+        }
+        if (!ok) default_crossovers(n, e->u.tsh.xover);
+        return true;
+    }
     case IMX_EQU1:
     case IMX_EQU2: {
         int n;
@@ -573,6 +636,154 @@ static void trim_process(ImxTrim *s, double *data, int stride, int n0, int n1, c
     }
 }
 
+/* — the peak of a level over the last W samples, this one included (0
+ *   before a reset): the transient shaper's and the expander's detector
+ *   (ImxPeakWindow). A monotonic deque of the samples that can still be the
+ *   peak, oldest first, levels strictly falling; the sample counter runs
+ *   mod 2^31, as the reference's does — */
+
+typedef struct {
+    int w, head, len;
+    uint32_t t;
+    int32_t *idx;
+    double *val;
+} ImxPeakWin;
+
+static bool peak_init(ImxPeakWin *s, int w)
+{
+    s->w = w;
+    s->head = s->len = 0;
+    s->t = 0;
+    s->idx = (int32_t *)malloc(sizeof(int32_t) * (size_t)w);
+    s->val = (double *)malloc(sizeof(double) * (size_t)w);
+    return s->idx != NULL && s->val != NULL;
+}
+
+static void peak_free(ImxPeakWin *s)
+{
+    free(s->idx); free(s->val);
+    s->idx = NULL; s->val = NULL; s->w = 0;
+}
+
+static void peak_reset(ImxPeakWin *s) { s->head = s->len = 0; s->t = 0; }
+
+/* Take the next sample's level; return the window's peak. */
+static double peak_push(ImxPeakWin *s, double l)
+{
+    int W = s->w, head = s->head, len = s->len, at;
+    uint32_t ix = s->t;
+    s->t = (ix + 1) & 0x7fffffffu;
+    if (len > 0 && ((ix - (uint32_t)s->idx[head]) & 0x7fffffffu) >= (uint32_t)W) {
+        head = head + 1 == W ? 0 : head + 1;
+        len--;
+    }
+    while (len > 0) {
+        int back = head + len - 1;
+        if (back >= W) back -= W;
+        if (s->val[back] > l) break;
+        len--;
+    }
+    at = head + len;
+    if (at >= W) at -= W;
+    s->idx[at] = (int32_t)ix;
+    s->val[at] = l;
+    s->head = head;
+    s->len = len + 1;
+    return s->val[head];
+}
+
+/* — downward expander, shutting like a gate below its floor (ImxExpander).
+ *   The detector hears the bus linked — through the key filter (an RBJ
+ *   high-pass, then low-pass, at Q 1/√2) when that is on — as the window's
+ *   peak or the compressor's 10 ms RMS. Shut below the floor until the level
+ *   is back the hysteresis above it; otherwise the expander's curve under the
+ *   threshold. The gain opens at the attack, and closes at the release once
+ *   the hold is over — */
+
+typedef struct {
+    TaudImxEquipment p;
+    ImxPeakWin win;
+    TaudBiquad hp, lp;
+    double atk, rel, rmsCoef;
+    int holdN;
+    double g;          /* the gain, dB (≤ 0) */
+    int hold;          /* samples of hold left */
+    bool shut;
+    double ms;         /* RMS detector's mean square */
+    bool oom;
+} ImxExpander;
+
+static void expd_init(ImxExpander *s)
+{
+    memset(s, 0, sizeof *s);
+    te_bq_init(&s->hp);
+    te_bq_init(&s->lp);
+}
+
+static void expd_configure(ImxExpander *s, const TaudImxEquipment *p, double rate)
+{
+    int w = imax(1, (int)js_round(IMX_EXPD_WINDOW_SEC * rate));
+    s->p = *p;
+    if (w != s->win.w) {
+        peak_free(&s->win);
+        if (!peak_init(&s->win, w)) s->oom = true;
+    }
+    s->atk = te_one_pole(p->u.expd.attackMs, rate);
+    s->rel = te_one_pole(p->u.expd.releaseMs, rate);
+    s->rmsCoef = te_one_pole(10, rate);
+    s->holdN = (int)js_round((p->u.expd.holdMs * rate) / 1000);
+    te_bq_high_pass(&s->hp, p->u.expd.keyLowCut, SQRT1_2, rate);
+    te_bq_low_pass(&s->lp, p->u.expd.keyHighCut, SQRT1_2, rate);
+}
+
+static void expd_reset(ImxExpander *s)
+{
+    if (s->win.w > 0) peak_reset(&s->win);
+    te_bq_reset(&s->hp);
+    te_bq_reset(&s->lp);
+    s->g = 0; s->hold = 0; s->shut = false; s->ms = 0;
+}
+
+static void expd_process(ImxExpander *s, double *data, int stride, int n0, int n1, const ImxCtx *ctx)
+{
+    int nch = ctx->nch, i, c;
+    double dry = ctx->dry;
+    bool key = s->p.u.expd.keyFilter, peak = s->p.u.expd.detector != COMP_RMS;
+    double T = s->p.u.expd.threshDb, slope = (double)s->p.u.expd.ratio - 1, range = s->p.u.expd.rangeDb;
+    double floor_ = s->p.u.expd.floorDb, reopen = floor_ + s->p.u.expd.hysteresisDb;
+    double g = s->g, ms = s->ms;
+    int hold = s->hold;
+    bool shut = s->shut;
+    if (s->oom) return;
+    if (dry > 0) copy_span(data, ctx->dryBuf, nch, stride, n0, n1);
+    for (i = n0; i < n1; i++) {
+        double l = 0, sum = 0, level, L, target, k;
+        for (c = 0; c < nch; c++) {
+            double x = data[c * stride + i];
+            if (key) x = te_bq_run(&s->lp, c, te_bq_run(&s->hp, c, x));
+            if (peak) { double a = x < 0 ? -x : x; if (a > l) l = a; } else sum += x * x;
+        }
+        if (peak) level = peak_push(&s->win, l);
+        else { ms += (sum / nch - ms) * s->rmsCoef; level = sqrt(ms); }
+        L = level > 1e-6 ? 20 * js_log10(level) : -120;
+        if (L < floor_) shut = true;
+        else if (L >= reopen) shut = false;
+        if (shut) target = -range;
+        else if (L < T) {
+            double under = (T - L) * slope;
+            target = under > range ? -range : -under;
+        } else target = 0;
+        /* Opening at the attack; closing at the release, once the hold is over. */
+        if (target >= g) { g += (target - g) * s->atk; hold = s->holdN; }
+        else if (hold > 0) hold--;
+        else g += (target - g) * s->rel;
+        k = te_db_to_gain(g);
+        for (c = 0; c < nch; c++) data[c * stride + i] *= k;
+    }
+    s->g = g; s->hold = hold; s->shut = shut; s->ms = ms;
+    mix_dry(data, ctx->dryBuf, nch, stride, n0, n1, dry);
+}
+
 /* — equaliser: up to eight bands; a cut band a Butterworth cascade of up to
  *   four sections, every other shape one RBJ section — */
 
@@ -746,90 +957,92 @@ static void deq_process(ImxDeq *s, double *data, int stride, int n0, int n1, con
     }
 }
 
-/* — compressor, one to six bands: Linkwitz–Riley 4th-order crossovers in a
- *   cascade, each band phase-matched through the all-pass of every later
- *   crossover, so the bands sum to the input through one all-pass each — */
+/* — the multiband split the compressor and the transient shaper share
+ *   (ImxSplit): Linkwitz–Riley 4th-order crossovers in a cascade, each band
+ *   phase-matched through the all-pass of every later crossover, so the bands
+ *   sum to the input through one all-pass each — */
+
+#define IMX_SPLIT_MAX 6
 
 typedef struct {
-    TaudImxEquipment p;
     int nch, bandsN;
-    TaudBiquad lp[IMX_COMP_MAX_BANDS - 1][2], hp[IMX_COMP_MAX_BANDS - 1][2];
-    TaudBiquad ap[IMX_COMP_MAX_BANDS][IMX_COMP_MAX_BANDS - 2];
-    TaudCompressor comps[IMX_COMP_MAX_BANDS];
-    double *bufs[IMX_COMP_MAX_BANDS];
+    TaudBiquad lp[IMX_SPLIT_MAX - 1][2], hp[IMX_SPLIT_MAX - 1][2];
+    TaudBiquad ap[IMX_SPLIT_MAX][IMX_SPLIT_MAX - 2];
+    double *bufs[IMX_SPLIT_MAX];
     bool oom;
-} ImxComp;
+} ImxSplit;
 
-static void comp_free(ImxComp *s)
+static void split_free(ImxSplit *s)
 {
     int k;
-    for (k = 0; k < IMX_COMP_MAX_BANDS; k++) { free(s->bufs[k]); s->bufs[k] = NULL; }
+    for (k = 0; k < IMX_SPLIT_MAX; k++) { free(s->bufs[k]); s->bufs[k] = NULL; }
 }
 
-static void comp_configure(ImxComp *s, const TaudImxEquipment *p, double rate)
+/* Make room for n bands; true when the count changed, so the caller's
+ * per-band state starts again too. */
+static bool split_resize(ImxSplit *s, int n)
 {
-    int n = p->u.comp.n, k, j;
-    s->p = *p;
-    if (n != s->bandsN) {
-        s->bandsN = n;
-        for (k = 0; k < IMX_COMP_MAX_BANDS - 1; k++) {
-            te_bq_init(&s->lp[k][0]); te_bq_init(&s->lp[k][1]);
-            te_bq_init(&s->hp[k][0]); te_bq_init(&s->hp[k][1]);
-        }
-        for (k = 0; k < IMX_COMP_MAX_BANDS; k++)
-            for (j = 0; j < IMX_COMP_MAX_BANDS - 2; j++) te_bq_init(&s->ap[k][j]);
-        memset(s->comps, 0, sizeof s->comps);
-        for (k = 0; k < IMX_COMP_MAX_BANDS; k++) s->comps[k].levelDb = -120;
-        comp_free(s);
-        if (n > 1) {
-            for (k = 0; k < n; k++) {
-                s->bufs[k] = (double *)calloc((size_t)s->nch * TRACKER_CHUNK, sizeof(double));
-                if (s->bufs[k] == NULL) s->oom = true;
-            }
+    int k, j;
+    if (n == s->bandsN) return false;
+    s->bandsN = n;
+    for (k = 0; k < IMX_SPLIT_MAX - 1; k++) {
+        te_bq_init(&s->lp[k][0]); te_bq_init(&s->lp[k][1]);
+        te_bq_init(&s->hp[k][0]); te_bq_init(&s->hp[k][1]);
+    }
+    for (k = 0; k < IMX_SPLIT_MAX; k++)
+        for (j = 0; j < IMX_SPLIT_MAX - 2; j++) te_bq_init(&s->ap[k][j]);
+    split_free(s);
+    if (n > 1) {
+        for (k = 0; k < n; k++) {
+            s->bufs[k] = (double *)calloc((size_t)s->nch * TRACKER_CHUNK, sizeof(double));
+            if (s->bufs[k] == NULL) s->oom = true;
         }
     }
+    return true;
+}
+
+static void split_configure(ImxSplit *s, const float *xover, double rate)
+{
+    int n = s->bandsN, k, j;
     for (k = 0; k < n - 1; k++) {
-        double f = p->u.comp.xover[k];
+        double f = xover[k];
         te_bq_low_pass(&s->lp[k][0], f, SQRT1_2, rate); te_bq_low_pass(&s->lp[k][1], f, SQRT1_2, rate);
         te_bq_high_pass(&s->hp[k][0], f, SQRT1_2, rate); te_bq_high_pass(&s->hp[k][1], f, SQRT1_2, rate);
     }
-    for (k = 0; k < n; k++) {
-        const TaudImxCompBand *b = &p->u.comp.b[k];
-        for (j = k + 1; j < n - 1; j++) te_bq_all_pass(&s->ap[k][j - k - 1], p->u.comp.xover[j], SQRT1_2, rate);
-        te_comp_configure(&s->comps[k], p->u.comp.detector, b->threshDb, b->ratio, b->attackMs,
-                          b->releaseMs, b->kneeDb, b->makeupDb, rate);
-    }
+    for (k = 0; k < n; k++)
+        for (j = k + 1; j < n - 1; j++) te_bq_all_pass(&s->ap[k][j - k - 1], xover[j], SQRT1_2, rate);
 }
 
-static void comp_reset(ImxComp *s)
+static void split_reset(ImxSplit *s)
 {
     int k, j;
-    for (k = 0; k < IMX_COMP_MAX_BANDS - 1; k++) {
+    for (k = 0; k < IMX_SPLIT_MAX - 1; k++) {
         te_bq_reset(&s->lp[k][0]); te_bq_reset(&s->lp[k][1]);
         te_bq_reset(&s->hp[k][0]); te_bq_reset(&s->hp[k][1]);
     }
-    for (k = 0; k < IMX_COMP_MAX_BANDS; k++)
-        for (j = 0; j < IMX_COMP_MAX_BANDS - 2; j++) te_bq_reset(&s->ap[k][j]);
-    for (k = 0; k < IMX_COMP_MAX_BANDS; k++) te_comp_reset(&s->comps[k]);
+    for (k = 0; k < IMX_SPLIT_MAX; k++)
+        for (j = 0; j < IMX_SPLIT_MAX - 2; j++) te_bq_reset(&s->ap[k][j]);
 }
 
-static void comp_process(ImxComp *s, double *data, int stride, int n0, int n1, const ImxCtx *ctx)
+/* The bands summed into `out` over [n0, n1). */
+static void split_sum(ImxSplit *s, double *out, int stride, int n0, int n1, int nch)
 {
-    int nch = ctx->nch, n = s->bandsN, i, k, c, j;
-    double dry = ctx->dry;
-    if (n == 1) {
-        TaudCompressor *comp = &s->comps[0];
-        if (dry > 0) copy_span(data, ctx->dryBuf, nch, stride, n0, n1);
-        if (s->p.u.comp.b[0].on) {
-            for (i = n0; i < n1; i++) {
-                double g = te_comp_step_planar(comp, data, i, stride, nch);
-                for (c = 0; c < nch; c++) data[c * stride + i] *= g;
-            }
+    int n = s->bandsN, c, i, k;
+    for (c = 0; c < nch; c++) {
+        int o = c * stride;
+        for (i = n0; i < n1; i++) {
+            double sum = 0;
+            for (k = 0; k < n; k++) sum += s->bufs[k][o + i];
+            out[o + i] = sum;
         }
-        mix_dry(data, ctx->dryBuf, nch, stride, n0, n1, dry);
-        return;
     }
-    if (s->oom) return;
+}
+
+/* Split [n0, n1) of `data` into the bands (s->bufs), and — when `dryBuf` is
+ * given — their untouched sum into it. */
+static void split_run(ImxSplit *s, const double *data, int stride, int n0, int n1, int nch, double *dryBuf)
+{
+    int n = s->bandsN, c, i, k, j;
     /* Split: rest ← input; band k ← LR4 low of rest; rest ← LR4 high of rest. */
     for (c = 0; c < nch; c++) {
         int o = c * stride;
@@ -849,33 +1062,174 @@ static void comp_process(ImxComp *s, double *data, int stride, int n0, int n1, c
             }
         }
     }
-    /* The dry reference: the bands summed untouched. */
-    if (dry > 0) {
-        for (c = 0; c < nch; c++) {
-            int o = c * stride;
+    if (dryBuf != NULL) split_sum(s, dryBuf, stride, n0, n1, nch);
+}
+
+/* — compressor, one to six bands: one band is the mastering chain's
+ *   compressor, linked across the bus; more compress each band of the split
+ *   by its own detector and sum them — */
+
+typedef struct {
+    TaudImxEquipment p;
+    ImxSplit xo;
+    TaudCompressor comps[IMX_COMP_MAX_BANDS];
+} ImxComp;
+
+static void comp_configure(ImxComp *s, const TaudImxEquipment *p, double rate)
+{
+    int n = p->u.comp.n, k;
+    s->p = *p;
+    if (split_resize(&s->xo, n)) {
+        memset(s->comps, 0, sizeof s->comps);
+        for (k = 0; k < IMX_COMP_MAX_BANDS; k++) s->comps[k].levelDb = -120;
+    }
+    split_configure(&s->xo, p->u.comp.xover, rate);
+    for (k = 0; k < n; k++) {
+        const TaudImxCompBand *b = &p->u.comp.b[k];
+        te_comp_configure(&s->comps[k], p->u.comp.detector, b->threshDb, b->ratio, b->attackMs,
+                          b->releaseMs, b->kneeDb, b->makeupDb, rate);
+    }
+}
+
+static void comp_reset(ImxComp *s)
+{
+    int k;
+    split_reset(&s->xo);
+    for (k = 0; k < IMX_COMP_MAX_BANDS; k++) te_comp_reset(&s->comps[k]);
+}
+
+static void comp_process(ImxComp *s, double *data, int stride, int n0, int n1, const ImxCtx *ctx)
+{
+    int nch = ctx->nch, n = s->xo.bandsN, i, k, c;
+    double dry = ctx->dry;
+    if (n == 1) {
+        TaudCompressor *comp = &s->comps[0];
+        if (dry > 0) copy_span(data, ctx->dryBuf, nch, stride, n0, n1);
+        if (s->p.u.comp.b[0].on) {
             for (i = n0; i < n1; i++) {
-                double sum = 0;
-                for (k = 0; k < n; k++) sum += s->bufs[k][o + i];
-                ctx->dryBuf[o + i] = sum;
+                double g = te_comp_step_planar(comp, data, i, stride, nch);
+                for (c = 0; c < nch; c++) data[c * stride + i] *= g;
             }
         }
+        mix_dry(data, ctx->dryBuf, nch, stride, n0, n1, dry);
+        return;
     }
+    if (s->xo.oom) return;
+    split_run(&s->xo, data, stride, n0, n1, nch, dry > 0 ? ctx->dryBuf : NULL);
     for (k = 0; k < n; k++) {
         TaudCompressor *comp = &s->comps[k];
-        double *b = s->bufs[k];
+        double *b = s->xo.bufs[k];
         if (!s->p.u.comp.b[k].on) continue;     /* an unused band passes, unprocessed */
         for (i = n0; i < n1; i++) {
             double g = te_comp_step_planar(comp, b, i, stride, nch);
             for (c = 0; c < nch; c++) b[c * stride + i] *= g;
         }
     }
-    for (c = 0; c < nch; c++) {
-        int o = c * stride;
-        for (i = n0; i < n1; i++) {
-            double sum = 0;
-            for (k = 0; k < n; k++) sum += s->bufs[k][o + i];
-            data[o + i] = sum;
+    split_sum(&s->xo, data, stride, n0, n1, nch);
+    mix_dry(data, ctx->dryBuf, nch, stride, n0, n1, dry);
+}
+
+/* — transient shaper, one to six bands over the split: blind to level. Per
+ *   band, S rises toward the window's peak P at the attack time and drops
+ *   with it at once (transient = 1 − S/P); L rises with P at once and falls
+ *   at the sustain time (sustain = 1 − P/L); the gain glides toward
+ *   attack × transient + sustain × sustain through a 1 ms one-pole — */
+
+typedef struct {
+    TaudImxEquipment p;
+    int nch, win;
+    double rate;
+    ImxSplit xo;
+    ImxPeakWin peak[IMX_TSH_MAX_BANDS];
+    double S[IMX_TSH_MAX_BANDS], L[IMX_TSH_MAX_BANDS], e[IMX_TSH_MAX_BANDS];
+    double atk[IMX_TSH_MAX_BANDS], rel[IMX_TSH_MAX_BANDS];
+    double smooth;
+    bool oom;
+} ImxTransient;
+
+static void tsh_free(ImxTransient *s)
+{
+    int k;
+    split_free(&s->xo);
+    for (k = 0; k < IMX_TSH_MAX_BANDS; k++) peak_free(&s->peak[k]);
+}
+
+static void tsh_clear(ImxTransient *s)
+{
+    int k;
+    for (k = 0; k < IMX_TSH_MAX_BANDS; k++) {
+        if (s->peak[k].w > 0) peak_reset(&s->peak[k]);
+        s->S[k] = s->L[k] = s->e[k] = 0;
+    }
+}
+
+static void tsh_configure(ImxTransient *s, const TaudImxEquipment *p, double rate)
+{
+    int n = p->u.tsh.n, k;
+    int win = imax(1, (int)js_round(IMX_TSH_WINDOW_SEC * rate));
+    s->p = *p;
+    if (split_resize(&s->xo, n) || win != s->win || rate != s->rate) {
+        s->win = win;
+        for (k = 0; k < IMX_TSH_MAX_BANDS; k++) peak_free(&s->peak[k]);
+        for (k = 0; k < n; k++) if (!peak_init(&s->peak[k], win)) s->oom = true;
+        tsh_clear(s);
+    }
+    if (s->xo.oom) s->oom = true;
+    s->rate = rate;
+    s->smooth = te_one_pole(IMX_TSH_SMOOTH_MS, rate);
+    split_configure(&s->xo, p->u.tsh.xover, rate);
+    for (k = 0; k < n; k++) {
+        s->atk[k] = te_one_pole(p->u.tsh.b[k].attackMs, rate);
+        s->rel[k] = te_one_pole(p->u.tsh.b[k].releaseMs, rate);
+    }
+}
+
+static void tsh_reset(ImxTransient *s)
+{
+    split_reset(&s->xo);
+    tsh_clear(s);
+}
+
+/* Band k over [n0, n1) of `b`, in place. */
+static void tsh_band(ImxTransient *s, int k, double *b, int stride, int n0, int n1, int nch)
+{
+    const TaudImxTshBand *band = &s->p.u.tsh.b[k];
+    ImxPeakWin *win = &s->peak[k];
+    double S = s->S[k], L = s->L[k], e = s->e[k];
+    double atk = s->atk[k], rel = s->rel[k], sm = s->smooth;
+    double ga = band->attackDb, gs = band->sustainDb, out = band->outDb;
+    int i, c;
+    for (i = n0; i < n1; i++) {
+        double l = 0, P, tr, su, g;
+        for (c = 0; c < nch; c++) {
+            double x = b[c * stride + i];
+            double a = x < 0 ? -x : x;
+            if (a > l) l = a;
         }
+        P = peak_push(win, l);
+        S = P > S ? S + (P - S) * atk : P;
+        L = P < L ? L + (P - L) * rel : P;
+        tr = P > 0 ? 1 - S / P : 0;
+        su = L > 0 ? 1 - P / L : 0;
+        e += (ga * tr + gs * su - e) * sm;
+        g = te_db_to_gain(e + out);
+        for (c = 0; c < nch; c++) b[c * stride + i] *= g;
+    }
+    s->S[k] = S; s->L[k] = L; s->e[k] = e;
+}
+
+static void tsh_process(ImxTransient *s, double *data, int stride, int n0, int n1, const ImxCtx *ctx)
+{
+    int nch = ctx->nch, n = s->xo.bandsN, k;
+    double dry = ctx->dry;
+    if (s->oom) return;
+    if (n == 1) {
+        if (dry > 0) copy_span(data, ctx->dryBuf, nch, stride, n0, n1);
+        if (s->p.u.tsh.b[0].on) tsh_band(s, 0, data, stride, n0, n1, nch);
+    } else {
+        split_run(&s->xo, data, stride, n0, n1, nch, dry > 0 ? ctx->dryBuf : NULL);
+        for (k = 0; k < n; k++) if (s->p.u.tsh.b[k].on) tsh_band(s, k, s->xo.bufs[k], stride, n0, n1, nch);
+        split_sum(&s->xo, data, stride, n0, n1, nch);
     }
     mix_dry(data, ctx->dryBuf, nch, stride, n0, n1, dry);
 }
@@ -1581,9 +1935,11 @@ static void *make_stage(TaudImxChain *c, int k)
     void *s = NULL;
     switch (k) {
     case IMX_ITRM: s = calloc(1, sizeof(ImxTrim)); break;
+    case IMX_EXPD: s = malloc(sizeof(ImxExpander)); if (s) expd_init((ImxExpander *)s); break;
+    case IMX_TSH1: s = calloc(1, sizeof(ImxTransient)); if (s) ((ImxTransient *)s)->xo.nch = c->nch; break;
     case IMX_EQU1: case IMX_EQU2: s = malloc(sizeof(ImxEq)); if (s) eq_init((ImxEq *)s); break;
     case IMX_DEQ1: case IMX_DEQ2: s = malloc(sizeof(ImxDeq)); if (s) deq_init((ImxDeq *)s, c->rate); break;
-    case IMX_COMP: s = calloc(1, sizeof(ImxComp)); if (s) ((ImxComp *)s)->nch = c->nch; break;
+    case IMX_COMP: s = calloc(1, sizeof(ImxComp)); if (s) ((ImxComp *)s)->xo.nch = c->nch; break;
     case IMX_SATU: s = calloc(1, sizeof(ImxSat)); break;
     case IMX_UNIS: s = malloc(sizeof(ImxUnison)); if (s) unis_init((ImxUnison *)s, c->nch, c->rate); break;
     case IMX_VERB: s = calloc(1, sizeof(ImxVerb)); if (s) ((ImxVerb *)s)->nch = c->nch; break;
@@ -1598,7 +1954,9 @@ static void free_stage(int k, void *s)
 {
     if (s == NULL) return;
     switch (k) {
-    case IMX_COMP: comp_free((ImxComp *)s); break;
+    case IMX_EXPD: peak_free(&((ImxExpander *)s)->win); break;
+    case IMX_TSH1: tsh_free((ImxTransient *)s); break;
+    case IMX_COMP: split_free(&((ImxComp *)s)->xo); break;
     case IMX_UNIS: free(((ImxUnison *)s)->buf); break;
     case IMX_VERB: verb_free((ImxVerb *)s); break;
     case IMX_DLAY: free(((ImxDelay *)s)->buf); break;
@@ -1616,7 +1974,9 @@ static void stage_configure(TaudImxChain *c, int k, const TaudImxEquipment *e)
     case IMX_ITRM: trim_configure((ImxTrim *)s, e); break;
     case IMX_EQU1: case IMX_EQU2: eq_configure((ImxEq *)s, e, rate); break;
     case IMX_DEQ1: case IMX_DEQ2: deq_configure((ImxDeq *)s, e, rate); break;
-    case IMX_COMP: comp_configure((ImxComp *)s, e, rate); if (((ImxComp *)s)->oom) c->oom = true; break;
+    case IMX_EXPD: expd_configure((ImxExpander *)s, e, rate); if (((ImxExpander *)s)->oom) c->oom = true; break;
+    case IMX_TSH1: tsh_configure((ImxTransient *)s, e, rate); if (((ImxTransient *)s)->oom) c->oom = true; break;
+    case IMX_COMP: comp_configure((ImxComp *)s, e, rate); if (((ImxComp *)s)->xo.oom) c->oom = true; break;
     case IMX_SATU: sat_configure((ImxSat *)s, e, rate); break;
     case IMX_UNIS: unis_configure((ImxUnison *)s, e, rate); if (((ImxUnison *)s)->oom) c->oom = true; break;
     case IMX_VERB: verb_configure((ImxVerb *)s, e, rate); if (((ImxVerb *)s)->oom) c->oom = true; break;
@@ -1631,6 +1991,8 @@ static void stage_reset(int k, void *s)
     switch (k) {
     case IMX_EQU1: case IMX_EQU2: eq_reset((ImxEq *)s); break;
     case IMX_DEQ1: case IMX_DEQ2: deq_reset((ImxDeq *)s); break;
+    case IMX_EXPD: expd_reset((ImxExpander *)s); break;
+    case IMX_TSH1: tsh_reset((ImxTransient *)s); break;
     case IMX_COMP: comp_reset((ImxComp *)s); break;
     case IMX_SATU: sat_reset((ImxSat *)s); break;
     case IMX_UNIS: unis_reset((ImxUnison *)s); break;
@@ -1661,6 +2023,8 @@ static void stage_process(TaudImxChain *c, int k, double *data, int stride, int 
     case IMX_ITRM: trim_process((ImxTrim *)s, data, stride, n0, n1, ctx); break;
     case IMX_EQU1: case IMX_EQU2: eq_process((ImxEq *)s, data, stride, n0, n1, ctx); break;
     case IMX_DEQ1: case IMX_DEQ2: deq_process((ImxDeq *)s, data, stride, n0, n1, ctx); break;
+    case IMX_EXPD: expd_process((ImxExpander *)s, data, stride, n0, n1, ctx); break;
+    case IMX_TSH1: tsh_process((ImxTransient *)s, data, stride, n0, n1, ctx); break;
     case IMX_COMP: comp_process((ImxComp *)s, data, stride, n0, n1, ctx); break;
     case IMX_SATU: sat_process((ImxSat *)s, data, stride, n0, n1, ctx); break;
     case IMX_UNIS: unis_process((ImxUnison *)s, data, stride, n0, n1, ctx); break;

@@ -991,17 +991,19 @@ void te_master_chain_process(TaudMasterChain *c, float *left, float *right, int 
 /* The equipment, in pipeline-0 order; pipeline 1 swaps the delay and the
  * reverb. The index is this port's; the file names each by its FourCC. */
 enum {
-    IMX_ITRM, IMX_EQU1, IMX_DEQ1, IMX_COMP, IMX_EQU2, IMX_DEQ2,
+    IMX_ITRM, IMX_EXPD, IMX_EQU1, IMX_DEQ1, IMX_TSH1, IMX_COMP, IMX_EQU2, IMX_DEQ2,
     IMX_UNIS, IMX_SATU, IMX_DLAY, IMX_VERB, IMX_LIMI, IMX_MXTL, IMX_KINDS
 };
 #define IMX_EQ_MAX_BANDS 8
 #define IMX_COMP_MAX_BANDS 6
+#define IMX_TSH_MAX_BANDS 6
 #define IMX_DEQ_BANDS 6
 #define IMX_UNIS_MAX_VOICES 8
 
 typedef struct { int wave; bool retrigger, sync; uint32_t rate; float depth; } TaudImxLfoParams;
 typedef struct { bool on; int shape, slope; float freq, gainDb, q; } TaudImxEqBand;
 typedef struct { bool on; float threshDb, ratio, attackMs, releaseMs, kneeDb, makeupDb; } TaudImxCompBand;
+typedef struct { bool on; float attackDb, sustainDb, attackMs, releaseMs, outDb; } TaudImxTshBand;
 typedef struct {
     bool on, unlinked, boost;
     float freq, q, gainDb, senseFreq, senseQ, threshDb, ratio, attackMs, releaseMs, rangeDb, actorDb;
@@ -1014,6 +1016,12 @@ typedef struct {
     int dry;                    /* 0 = all wet … 255 = all dry */
     union {
         struct { float gainDb; } trim;
+        /* floorDb is −∞ for no floor (a pure expander). */
+        struct {
+            bool keyFilter; int detector;
+            float threshDb, floorDb, ratio, rangeDb, attackMs, holdMs, releaseMs, hysteresisDb, keyLowCut, keyHighCut;
+        } expd;
+        struct { int n; float xover[IMX_TSH_MAX_BANDS - 1]; TaudImxTshBand b[IMX_TSH_MAX_BANDS]; } tsh;
         struct { int n; TaudImxEqBand b[IMX_EQ_MAX_BANDS]; } eq;
         struct { int detector, n; float xover[IMX_COMP_MAX_BANDS - 1]; TaudImxCompBand b[IMX_COMP_MAX_BANDS]; } comp;
         struct { TaudImxDeqBand b[IMX_DEQ_BANDS]; } deq;

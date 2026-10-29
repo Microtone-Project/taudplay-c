@@ -477,12 +477,29 @@ if (process.env.FUZZ_IMIX !== "0" && chance(process.env.FUZZ_IMIX ? 1 : 0.7)) {
         feedback: f(0, 1.1), highCut: f(800, 18000), lowCut: f(30, 900), wow: chance(0.3) ? 0 : rnd(), driveDb: f(0, 18) };
     },
     limi: () => ({ truePeak: chance(0.5), ceilingDb: f(-18, 0), releaseMs: f(5, 400), gainDb: f(-6, 12) }),
+    // The expander: no floor (−∞), a floor at the threshold (a pure gate), or one under it.
+    expd: () => {
+      const threshDb = f(-70, -5);
+      const floorDb = chance(0.4) ? -Infinity : chance(0.35) ? threshDb : f(Math.max(-80, threshDb - 30), threshDb);
+      return { threshDb, floorDb, ratio: f(1, 8), rangeDb: f(0, 70), attackMs: f(0.1, 40), holdMs: chance(0.3) ? 0 : f(0, 200),
+        releaseMs: f(5, 600), hysteresisDb: f(0, 10), detector: ri(0, 1), keyFilter: chance(0.4),
+        keyLowCut: f(20, 800), keyHighCut: f(800, 18000) };
+    },
+    tsh1: () => {
+      const n = ri(1, 6);
+      const xs = [];
+      let x = 60;
+      for (let i = 1; i < n; i++) { x *= f(1.6, 4); xs.push(x); }
+      return { crossovers: xs, bands: Array.from({ length: n }, () => ({ on: chance(0.85), attackDb: f(-18, 18),
+        sustainDb: f(-18, 18), attackMs: f(1, 120), releaseMs: f(10, 1500), outDb: f(-6, 6) })) };
+    },
     mxtl: () => ({ swap: chance(0.3), invL: chance(0.3), invR: chance(0.3), removeDc: chance(0.5),
       gainDb: f(-9, 9), width: chance(0.4) ? 1 : f(0, 2) }),
   };
   gen.equ2 = gen.equ1;
   gen.deq2 = gen.deq1;
-  const KINDS = Object.keys(gen);
+  // FUZZ_IMIX_KINDS=tsh1,expd draws the equipment from those alone.
+  const KINDS = process.env.FUZZ_IMIX_KINDS ? process.env.FUZZ_IMIX_KINDS.split(",") : Object.keys(gen);
   const ids = [];
   const nBlocks = ri(1, 4);
   for (let k = 0; k < nBlocks; k++) {
